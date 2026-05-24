@@ -1,0 +1,44 @@
+{
+  "name": "pi-resolve",
+  "version": "0.1.0",
+  "description": "Resolve @file references and !`command` expressions in Pi prompts.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Marek Pazik",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/marekpazik/pi-resolve"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/z-pi-resolve.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
