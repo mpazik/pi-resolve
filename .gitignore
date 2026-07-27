@@ -1,6 +1,10 @@
 node_modules/
 .pi/
 .residue/
+/tmp/
 package-lock.json
 *.log
 .DS_Store
+
+# JetBrains IDE config
+.idea/

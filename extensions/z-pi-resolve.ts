@@ -2,7 +2,7 @@
  * pi-resolve
  *
  * Resolves @file and !`command` references in user input, system prompt,
- * skill content, and Skill tool results.
+ * and skill content.
  *
  * Syntax:
  *   @path/to/file.md  — attach file contents as context (relative to cwd or containing file)
@@ -12,15 +12,16 @@
  * References inside fenced code blocks or inline code spans are ignored.
  *
  * Behavior:
- *   - !`command`: inlined into text (replaces the reference with output)
- *   - @file: attached as separate context alongside the text
- *   - @file refs in imported files are resolved recursively (max depth 5)
- *   - Nested @file paths resolve relative to the containing file's directory
+ *   - @file and !`command`: both attached as separate context alongside the
+ *     text. The original text is kept as-is (user sees what they typed).
+ *   - Resolution is single-level: @file refs and !`command` refs inside
+ *     resolved file contents or command output are NOT followed. Resolved
+ *     content is treated as inert text.
  *   - User input: resolved every turn
- *   - System prompt / AGENTS.md: resolved first turn only
+ *   - System prompt / AGENTS.md: resolved first turn only (commands inlined
+ *     into the prompt text itself, display only)
  *   - Skills: !`command` and @file resolved after expansion, with $ARGUMENTS
  *     substitution and skill baseDir as cwd
- *   - Skill tool results: !`command` resolved via tool_result hook
  *   - Errors: attached with error marker, shown as warnings in TUI
  *
  * Settings:
@@ -32,8 +33,7 @@
  *     "sources": {
  *       "userInput":       {},
  *       "systemPrompt":    { "display": "errors" },
- *       "skill":           { "commands": false },
- *       "skillToolResult": { "display": "never" }
+ *       "skill":           { "commands": false }
  *     }
  *   }
  *
@@ -43,32 +43,28 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { stat, readFile } from "node:fs/promises";
-import { isAbsolute, join, dirname } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
-
-// ---------- regex patterns ----------
-
-/** Matches `@relative/path` but not inside backticks, preceded by word chars, `/` (npm scopes), or quotes (imports).
- *  Supports backslash-escaped characters (e.g., `\ ` for spaces in paths).
- *  Also matches `@~/...` for home directory references.
- *  Excludes quotes, semicolons, and brackets from path characters to avoid matching
- *  import statements, parenthesized expressions, and markdown link syntax. */
-const FILE_REGEX =
-  /(?<![\w`/"'])@(~\/(?:[^\s`,.\\"';()[\]{}]|\\.)*(?:\.(?:[^\s`,.\\"';()[\]{}]|\\.)+)*|\.?(?:[^\s`,.\\"';()[\]{}]|\\.)*(?:\.(?:[^\s`,.\\"';()[\]{}]|\\.)+)*)/g;
-
-/** Matches `` !`command` `` but not when `!` is preceded by a backtick (e.g., inline code `!`) */
-const SHELL_REGEX = /(?<!`)!`([^`]+)`/g;
-
-/** Matches a <skill> block with optional trailing arguments */
-const SKILL_BLOCK_REGEX =
-  /^<skill name="([^"]+)" location="([^"]+)">\nReferences are relative to ([^\n]+)\.\n\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/;
+import {
+  Container,
+  getCapabilities,
+  hyperlink,
+  Loader,
+  Spacer,
+  Text,
+} from "@earendil-works/pi-tui";
+import {
+  SKILL_BLOCK_REGEX,
+  extractFileRefs,
+  extractCommandRefs,
+} from "./matcher.ts";
 
 // ---------- settings ----------
 
-type Source = "userInput" | "systemPrompt" | "skill" | "skillToolResult";
+type Source = "userInput" | "systemPrompt" | "skill";
 type Display = "always" | "never" | "errors";
 
 interface SourceConfig {
@@ -147,35 +143,6 @@ interface SkillBlock {
 
 const MAX_FILE_BYTES = 100_000;
 const MAX_BASH_BYTES = 100_000;
-const MAX_IMPORT_DEPTH = 5;
-
-// ---------- code ranges ----------
-
-/** Build a set of character ranges that fall inside fenced code blocks or inline code spans.
- *  Used to check whether a regex match at a given offset should be skipped. */
-function buildCodeRanges(text: string): Array<[start: number, end: number]> {
-  const ranges: Array<[number, number]> = [];
-  for (const m of text.matchAll(/^```[\s\S]*?^```/gm)) {
-    ranges.push([m.index, m.index + m[0].length]);
-  }
-  for (const m of text.matchAll(/!`[^`]+`|``[^`]*``|`[^`]*`/g)) {
-    if (m[0][0] !== "!") {
-      ranges.push([m.index, m.index + m[0].length]);
-    }
-  }
-  return ranges;
-}
-
-/** Check if a character offset falls inside any code range. */
-function isInsideCode(
-  offset: number,
-  ranges: Array<[number, number]>,
-): boolean {
-  for (const [start, end] of ranges) {
-    if (offset >= start && offset < end) return true;
-  }
-  return false;
-}
 
 // ---------- path resolution ----------
 
@@ -241,21 +208,13 @@ async function inlineBashRefs(
   pi: ExtensionAPI,
   source: Source,
 ): Promise<{ text: string; inlines: BashInline[] }> {
-  const codeRanges = buildCodeRanges(text);
-
-  // Collect all matches outside code ranges
-  const matches: Array<{ index: number; fullMatch: string; cmd: string }> = [];
-  for (const m of text.matchAll(SHELL_REGEX)) {
-    if (!isInsideCode(m.index, codeRanges)) {
-      matches.push({ index: m.index, fullMatch: m[0], cmd: m[1]! });
-    }
-  }
+  const matches = extractCommandRefs(text);
   if (matches.length === 0) return { text, inlines: [] };
 
   // Execute all commands in parallel
   const [results] = await Promise.all([
     Promise.all(
-      matches.map(async ({ cmd, fullMatch }) => {
+      matches.map(async ({ command: cmd, fullMatch }) => {
         try {
           const result = await pi.exec("sh", ["-c", cmd], {
             cwd,
@@ -350,32 +309,21 @@ async function inlineBashRefs(
 // ---------- file resolution ----------
 
 /** Resolve @file references in text, returning attachments.
- *  Recursively resolves @file refs found in imported files up to maxDepth.
- *  Nested refs resolve relative to the containing file's directory. */
+ *  Single-level only: @file refs inside resolved file contents are NOT
+ *  followed as often leads to errors. 
+ *  Resolved content is treated as inert text. 
+ */
 async function resolveFileRefs(
   text: string,
   baseDir: string,
-  visited: Set<string>,
-  depth: number,
   source: Source,
 ): Promise<FileAttachment[]> {
-  const codeRanges = buildCodeRanges(text);
-  const matches = Array.from(text.matchAll(FILE_REGEX)).filter(
-    (m) => !isInsideCode(m.index, codeRanges),
-  );
-  if (matches.length === 0) return [];
+  const names = extractFileRefs(text);
+  if (names.length === 0) return [];
 
   const attachments: FileAttachment[] = [];
-  for (const match of matches) {
-    const name = match[1]!.replace(/\\(.)/g, "$1");
-
-    // Skip bare words without `/` or `.` — these are decorators, JSDoc tags,
-    // CSS @rules, mentions, etc. Use `@./Makefile` for extensionless files.
-    if (!name.includes("/") && !name.includes(".")) continue;
-
+  for (const name of names) {
     const filepath = resolvePath(name, baseDir);
-
-    if (visited.has(filepath)) continue;
 
     try {
       const stats = await stat(filepath);
@@ -399,19 +347,6 @@ async function resolveFileRefs(
         displayPath: name,
         content,
       });
-
-      if (depth < MAX_IMPORT_DEPTH && filepath.endsWith(".md")) {
-        visited.add(filepath);
-        const nestedDir = dirname(filepath);
-        const nested = await resolveFileRefs(
-          content,
-          nestedDir,
-          visited,
-          depth + 1,
-          source,
-        );
-        attachments.push(...nested);
-      }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       attachments.push({
@@ -448,6 +383,8 @@ function formatAttachment(a: FileAttachment): string {
 interface AttachmentLine {
   kind: "file" | "bash";
   label: string;
+  /** Resolved absolute path, file items only. Used for terminal hyperlinks. */
+  path?: string;
   lines: number;
   result: "ok" | "error" | "skipped";
   message?: string;
@@ -495,6 +432,7 @@ function buildDetails(
     items.push({
       kind: "file",
       label: a.displayPath,
+      path: a.resolvedPath,
       lines: result === "ok" ? countLines(a.content) : 0,
       result,
       message:
@@ -512,8 +450,9 @@ export default function (pi: ExtensionAPI) {
   let systemContextInjected = false;
   let settings: Settings = DEFAULT_SETTINGS;
 
-  // Bash inlines from input event — display only (already inlined into text)
-  let pendingDisplayInlines: BashInline[] = [];
+  // Bash inlines captured from the input event. User text is kept as-is;
+  // outputs are attached as a separate context message in before_agent_start.
+  let pendingUserInlines: BashInline[] = [];
 
   pi.registerMessageRenderer<ContextDetails>(
     "context",
@@ -527,7 +466,11 @@ export default function (pi: ExtensionAPI) {
           item.kind === "file"
             ? theme.inverse(theme.fg("accent", " file "))
             : theme.inverse(theme.fg("bashMode", " bash "));
-        const label = theme.fg("dim", ` ${item.label}`);
+        const styledLabel = theme.fg("dim", ` ${item.label}`);
+        const label =
+          item.kind === "file" && item.path && getCapabilities().hyperlinks
+            ? hyperlink(styledLabel, pathToFileURL(item.path).href)
+            : styledLabel;
         let meta: string;
         if (item.result === "ok") {
           meta = theme.fg(
@@ -552,60 +495,55 @@ export default function (pi: ExtensionAPI) {
     settings = loadSettings(sessionCwd);
   });
 
-  // Inline !`command` in user input (before skill expansion)
-  pi.on("input", async (event) => {
+  // Resolve !`command` in user input, but keep the original text intact.
+  // Outputs are attached as a separate context message (like @file), so the
+  // user still sees what they typed. Runs before skill expansion.
+  pi.on("input", async (event, ctx) => {
     if (!cfgFor(settings, "userInput").commands) return { action: "continue" };
-    const { text, inlines } = await inlineBashRefs(
+
+    const matches = extractCommandRefs(event.text);
+    if (matches.length === 0) return { action: "continue" };
+
+    if (ctx.hasUI) {
+      const label =
+        matches.length === 1
+          ? matches[0]!.command
+          : `${matches.length} commands`;
+      ctx.ui.setWidget("pi-resolve", (tui, theme) => {
+        const loader = new Loader(
+          tui,
+          (s) => theme.fg("bashMode", s),
+          (s) => theme.fg("dim", s),
+          ` ${label}`,
+        );
+        loader.start();
+        return loader;
+      });
+    }
+
+    const { inlines } = await inlineBashRefs(
       event.text,
       sessionCwd,
       pi,
       "userInput",
     );
-    if (inlines.length > 0) {
-      pendingDisplayInlines = inlines;
-      return { action: "transform", text };
-    }
+
+    if (ctx.hasUI) ctx.ui.setWidget("pi-resolve", undefined);
+
+    if (inlines.length > 0) pendingUserInlines = inlines;
     return { action: "continue" };
-  });
-
-  // Resolve !`command` in Skill tool results (skill-tool extension returns
-  // raw content with unresolved refs; we intercept and inline them here)
-  pi.on("tool_result", async (event) => {
-    if (event.toolName !== "Skill" || event.isError) return;
-    if (!cfgFor(settings, "skillToolResult").commands) return;
-
-    const textParts = event.content.filter(
-      (c): c is { type: "text"; text: string } => c.type === "text",
-    );
-    if (textParts.length === 0) return;
-
-    let changed = false;
-    const newContent = await Promise.all(
-      event.content.map(async (part) => {
-        if (part.type !== "text") return part;
-        const { text: resolved, inlines } = await inlineBashRefs(
-          part.text,
-          sessionCwd,
-          pi,
-          "skillToolResult",
-        );
-        if (inlines.length > 0) changed = true;
-        return { type: "text" as const, text: resolved };
-      }),
-    );
-
-    if (changed) {
-      return { content: newContent };
-    }
   });
 
   pi.on("before_agent_start", async (event) => {
     const allAttachments: FileAttachment[] = [];
-    // Display-only: already inlined via input event, just need TUI display
-    const displayOnlyInlines: BashInline[] = [...pendingDisplayInlines];
-    pendingDisplayInlines = [];
-    // Context inlines: from skills/system prompt, need to be attached as context
+    // Display-only: inlined into their own text (system prompt), TUI display only
+    const displayOnlyInlines: BashInline[] = [];
+    // Context inlines: user input + skills — attached as a separate context message
     const contextInlines: BashInline[] = [];
+    // User-input commands captured in the input event (original text kept as-is)
+    const userInlines = pendingUserInlines;
+    pendingUserInlines = [];
+    contextInlines.push(...userInlines);
     let modifiedSystemPrompt: string | undefined;
 
     // --- System prompt — first turn only ---
@@ -628,13 +566,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const systemFileRefs = sysCfg.files
-        ? await resolveFileRefs(
-            inlinedSystem,
-            sessionCwd,
-            new Set<string>(),
-            0,
-            "systemPrompt",
-          )
+        ? await resolveFileRefs(inlinedSystem, sessionCwd, "systemPrompt")
         : [];
 
       if (systemFileRefs.length > 0 || systemInlines.length > 0) {
@@ -667,12 +599,9 @@ export default function (pi: ExtensionAPI) {
 
       if (skillCfg.files) {
         // @file refs resolve relative to skill baseDir (file references within the skill)
-        const visited = new Set<string>();
         const skillFileRefs = await resolveFileRefs(
           substituted,
           skill.baseDir,
-          visited,
-          0,
           "skill",
         );
         allAttachments.push(...skillFileRefs);
@@ -682,21 +611,17 @@ export default function (pi: ExtensionAPI) {
           const argsFileRefs = await resolveFileRefs(
             skill.args,
             sessionCwd,
-            visited,
-            0,
             "skill",
           );
           allAttachments.push(...argsFileRefs);
         }
       }
     } else if (cfgFor(settings, "userInput").files) {
-      // Regular user input: !`command` was already inlined via input event,
-      // just resolve @file refs
+      // Regular user input: commands were captured in the input event (attached
+      // as context, text kept as-is). Here we only resolve @file refs.
       const inputFileRefs = await resolveFileRefs(
         prompt,
         sessionCwd,
-        new Set<string>(),
-        0,
         "userInput",
       );
       allAttachments.push(...inputFileRefs);
@@ -728,8 +653,9 @@ export default function (pi: ExtensionAPI) {
     if (hasContent) {
       const content: { type: "text"; text: string }[] = [];
 
-      // Only context inlines (from skills) go into message content —
-      // display-only inlines (from input/system prompt) are already inlined in their text
+      // Context inlines (user input + skills) go into message content as a
+      // separate context message. Display-only inlines (system prompt) are
+      // already inlined into their own text.
       for (const b of contextInlines) {
         if (!b.skipped && !b.error) {
           content.push({

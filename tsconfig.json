@@ -6,8 +6,9 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    "allowImportingTsExtensions": true
   },
-  "include": ["extensions/**/*.ts", "src/**/*.ts"],
+  "include": ["extensions/**/*.ts", "src/**/*.ts", "tests/**/*.ts"],
   "exclude": ["node_modules"]
 }
