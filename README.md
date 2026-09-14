@@ -153,19 +153,31 @@ Settings live in their own file (not pi's `settings.json`):
     "display": "always"     // "always" | "never" | "errors"
   },
   "sources": {
-    "userInput":    {},                       // inherits everything
+    "userInput":    {},                       // includes prompt templates
     "systemPrompt": { "display": "errors" },  // only render on errors
-    "skill":        { "commands": false }     // no !`cmd` expansion in skills
+    "skill":        { "commands": false },    // no !`cmd` expansion in skills
+    "extension":    { "commands": false }     // explicit shared-resolver calls
   }
 }
 ```
 
 ### How it resolves
 
-For each source the effective config is `{ ...defaults, ...sources[name] }` —
-a shallow override. Missing source entries inherit `defaults` unchanged.
+Built-in, global, and project defaults merge per field, in that order. Global
+and project overrides also merge per field within each source. The merged source
+overrides are then applied over the merged defaults. Missing fields inherit.
+
+For example, global `sources.skill.commands: false` remains disabled when a
+project only sets `sources.skill.display: "never"`. Source-specific settings are
+more specific than defaults, including project defaults.
+
+Invalid JSON or unreadable settings files are ignored with a warning. Invalid
+object shapes, field types, display values, and unknown keys are warned about
+and ignored; valid fields still apply. Diagnostics do not include setting values.
 
 - `files` / `commands` — toggle that kind of resolution for that source.
+  `files` controls both file contents and directory listings. Set both to `false`
+  to disable resolution for a source.
 - `display` — when the TUI context summary should include items from this source:
   - `"always"` — every resolved item (ok, error, or skipped) appears.
   - `"errors"` — only error/skipped items appear; successful ones are silent.
@@ -174,6 +186,19 @@ a shallow override. Missing source entries inherit `defaults` unchanged.
 
 If filtering leaves no items at all, the context summary is omitted from the
 TUI. Content sent to the model is independent of `display`.
+
+### Shared-resolver policy
+
+Explicit shared-event calls use `sources.extension`, which inherits defaults,
+not `sources.userInput`. Existing consumers that configured `userInput` to
+restrict shared calls should move or copy those restrictions to `extension`.
+Caller restrictions can only reduce capabilities: `mode: "files"` never executes
+commands, and cannot enable files disabled by settings.
+
+Shared calls return structured results without automatically attaching them or
+rendering a UI summary. The calling extension/tool owns those actions;
+`extension.display` does not cause automatic rendering. Arbitrary tool inputs
+and outputs are not automatically resolved.
 
 ### Notes
 

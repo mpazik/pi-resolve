@@ -65,8 +65,15 @@ import {
 
 // ---------- settings ----------
 
-type Source = "userInput" | "systemPrompt" | "skill";
-type Display = "always" | "never" | "errors";
+import {
+  DEFAULT_SETTINGS,
+  cfgFor,
+  mergeSettings,
+  shouldDisplay,
+  validateSettings,
+  type Settings,
+  type Source,
+} from "./settings.ts";
 
 export const RESOLVE_REFERENCES_EVENT = "pi-resolve:resolve";
 
@@ -96,47 +103,28 @@ export interface ResolveReferencesRequest {
   response?: Promise<ResolveReferencesResult>;
 }
 
-interface SourceConfig {
-  files: boolean;
-  commands: boolean;
-  display: Display;
-}
-
-interface Settings {
-  defaults: SourceConfig;
-  sources: Partial<Record<Source, Partial<SourceConfig>>>;
-}
-
-const DEFAULT_SETTINGS: Settings = {
-  defaults: { files: true, commands: true, display: "always" },
-  sources: {},
-};
-
-function readJsonIfExists(path: string): any {
-  if (!existsSync(path)) return undefined;
+function readSettings(path: string) {
+  if (!existsSync(path)) return {};
+  let value: unknown;
   try {
-    return JSON.parse(readFileSync(path, "utf-8"));
-  } catch (err) {
-    console.error(`[pi-resolve] Failed to read ${path}: ${err}`);
-    return undefined;
+    value = JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    // JSON parse errors can include configuration contents. Do not log them.
+    console.error(`[pi-resolve] Unable to read or parse settings at ${path}; ignoring file`);
+    return {};
   }
+  const { settings, issues } = validateSettings(value);
+  for (const issue of issues) {
+    console.error(`[pi-resolve] ${path}: ${issue.path}: ${issue.code}; ignoring setting`);
+  }
+  return settings;
 }
 
 function loadSettings(cwd: string): Settings {
-  const global = readJsonIfExists(join(getAgentDir(), "pi-resolve.json")) ?? {};
-  const project = readJsonIfExists(join(cwd, ".pi", "pi-resolve.json")) ?? {};
-  return {
-    defaults: {
-      ...DEFAULT_SETTINGS.defaults,
-      ...(global.defaults ?? {}),
-      ...(project.defaults ?? {}),
-    },
-    sources: { ...(global.sources ?? {}), ...(project.sources ?? {}) },
-  };
-}
-
-function cfgFor(settings: Settings, src: Source): SourceConfig {
-  return { ...settings.defaults, ...(settings.sources[src] ?? {}) };
+  return mergeSettings(
+    readSettings(join(getAgentDir(), "pi-resolve.json")),
+    readSettings(join(cwd, ".pi", "pi-resolve.json")),
+  );
 }
 
 // ---------- types ----------
@@ -475,7 +463,7 @@ async function resolveReferencesForExtension(
   pi: ExtensionAPI,
   settings: Settings,
 ): Promise<ResolveReferencesResult> {
-  const config = cfgFor(settings, "userInput");
+  const config = cfgFor(settings, "extension");
   const candidates = [
     ...extractFileReferenceMatches(request.text).map((reference) => ({
       kind: "file" as const,
@@ -503,7 +491,7 @@ async function resolveReferencesForExtension(
       const attachment = await resolveFileReference(
         candidate.path,
         request.baseDir,
-        "userInput",
+        "extension",
       );
       const context =
         !attachment.skipped && !attachment.error
@@ -548,7 +536,7 @@ async function resolveReferencesForExtension(
       candidate.fullMatch,
       request.baseDir,
       pi,
-      "userInput",
+      "extension",
     );
     const inline = inlines[0]!;
     const context =
@@ -596,13 +584,6 @@ interface ContextDetails {
 function countLines(text: string): number {
   if (!text) return 0;
   return text.split("\n").length;
-}
-
-/** True if the item should be displayed under its source's display mode. */
-function shouldDisplay(display: Display, result: "ok" | "error" | "skipped") {
-  if (display === "never") return false;
-  if (display === "errors") return result !== "ok";
-  return true;
 }
 
 function buildDetails(
