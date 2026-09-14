@@ -78,19 +78,30 @@ export interface CommandRef {
   command: string;
 }
 
-/** Extract `@file` paths from `text`, in document order.
+/** An `@file` reference found in text, including its source offset. */
+export interface FileRef {
+  index: number;
+  fullMatch: string;
+  path: string;
+}
+
+/** Extract `@file` references from `text`, in document order.
  *  Skips refs inside code spans/fences, unescapes path characters, and
  *  drops bare words (no `/` and no `.`). */
-export function extractFileRefs(text: string): string[] {
+export function extractFileReferenceMatches(text: string): FileRef[] {
   const ranges = buildCodeRanges(text);
-  const out: string[] = [];
-  for (const m of text.matchAll(FILE_REGEX)) {
-    if (isInsideCode(m.index, ranges)) continue;
-    const name = unescapePath(m[1]!);
-    if (isBareWord(name)) continue;
-    out.push(name);
+  const out: FileRef[] = [];
+  for (const match of text.matchAll(FILE_REGEX)) {
+    if (isInsideCode(match.index, ranges)) continue;
+    const path = unescapePath(match[1]!);
+    if (isBareWord(path)) continue;
+    out.push({ index: match.index, fullMatch: match[0], path });
   }
   return out;
+}
+
+export function extractFileRefs(text: string): string[] {
+  return extractFileReferenceMatches(text).map((reference) => reference.path);
 }
 
 /** Extract `` !`command` `` references from `text`, in document order.

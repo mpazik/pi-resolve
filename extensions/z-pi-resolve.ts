@@ -256,13 +256,13 @@ async function inlineBashRefs(
             };
           }
 
-          if (result.code !== 0) {
+          if (result.killed || result.code !== 0) {
             // eslint-disable-next-line no-control-regex
             const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
             const output = stripAnsi(
               result.stderr.trim() || result.stdout.trim(),
             ).slice(0, 500);
-            const detail = output || `exit code ${result.code}`;
+            const detail = result.killed ? "command timed out or was killed" : output || `exit code ${result.code}`;
             console.error(`[pi-resolve] Shell error (${cmd}): ${detail}`);
             return {
               cmd,
@@ -628,6 +628,7 @@ function buildDetails(
 export default function (pi: ExtensionAPI) {
   let sessionCwd: string = process.cwd();
   let systemContextInjected = false;
+  let systemInlines: BashInline[] = [];
   let settings: Settings = DEFAULT_SETTINGS;
 
   // Bash inlines captured from the input event. User text is kept as-is;
@@ -680,6 +681,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     sessionCwd = ctx.cwd;
     systemContextInjected = false;
+    systemInlines = [];
     settings = loadSettings(sessionCwd);
   });
 
@@ -738,7 +740,6 @@ export default function (pi: ExtensionAPI) {
     if (!systemContextInjected) {
       const sysCfg = cfgFor(settings, "systemPrompt");
       let inlinedSystem = event.systemPrompt;
-      let systemInlines: BashInline[] = [];
 
       if (sysCfg.commands) {
         const r = await inlineBashRefs(
@@ -754,7 +755,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const systemFileRefs = sysCfg.files
-        ? await resolveFileRefs(inlinedSystem, sessionCwd, "systemPrompt")
+        ? await resolveFileRefs(event.systemPrompt, sessionCwd, "systemPrompt")
         : [];
 
       if (systemFileRefs.length > 0 || systemInlines.length > 0) {
@@ -762,6 +763,20 @@ export default function (pi: ExtensionAPI) {
         modifiedSystemPrompt = inlinedSystem;
       }
       systemContextInjected = true;
+    } else if (systemInlines.length > 0) {
+      // Pi rebuilds the base system prompt each turn. Reapply captured output
+      // without executing commands or replacing other extensions' context.
+      let text = event.systemPrompt;
+      const cached = [...systemInlines];
+      const replacements = extractCommandRefs(text).map((match) => {
+        const index = cached.findIndex((inline) => inline.command === match.command);
+        const inline = index < 0 ? undefined : cached.splice(index, 1)[0];
+        return { ...match, output: inline && !inline.error && !inline.skipped ? inline.output : match.fullMatch };
+      });
+      for (const match of replacements.reverse()) {
+        text = text.slice(0, match.index) + match.output + text.slice(match.index + match.fullMatch.length);
+      }
+      modifiedSystemPrompt = text;
     }
 
     // --- User input / skill content — every turn ---
@@ -804,15 +819,29 @@ export default function (pi: ExtensionAPI) {
           allAttachments.push(...argsFileRefs);
         }
       }
-    } else if (cfgFor(settings, "userInput").files) {
-      // Regular user input: commands were captured in the input event (attached
-      // as context, text kept as-is). Here we only resolve @file refs.
-      const inputFileRefs = await resolveFileRefs(
-        prompt,
-        sessionCwd,
-        "userInput",
-      );
-      allAttachments.push(...inputFileRefs);
+    } else {
+      const inputCfg = cfgFor(settings, "userInput");
+      if (inputCfg.commands) {
+        // Templates expand after input. Execute only commands not already
+        // captured there, consuming matches so repeated commands stay distinct.
+        const captured = userInlines.map((inline) => inline.command);
+        const remaining = extractCommandRefs(prompt).filter(({ command }) => {
+          const index = captured.indexOf(command);
+          if (index < 0) return true;
+          captured.splice(index, 1);
+          return false;
+        });
+        const { inlines } = await inlineBashRefs(
+          remaining.map(({ fullMatch }) => fullMatch).join("\n"),
+          sessionCwd,
+          pi,
+          "userInput",
+        );
+        contextInlines.push(...inlines);
+      }
+      if (inputCfg.files) {
+        allAttachments.push(...await resolveFileRefs(prompt, sessionCwd, "userInput"));
+      }
     }
 
     const dedupedAttachments = dedup(allAttachments);

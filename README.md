@@ -207,6 +207,8 @@ and outputs are not automatically resolved.
 
 ## Development
 
+Use Node.js 26.
+
 ```bash
 npm install
 npm run typecheck
@@ -214,16 +216,6 @@ npm test
 pi -e .
 ```
 
-Run matcher and shared-event integration checks without provider calls:
-
-```bash
-node --test tests/matcher.test.ts tests/shared-event.test.ts
-```
-
-The shared-event tests load the real extension on Pi's event bus with temporary
-files and isolated settings. They check file-only command suppression, inert
-imports, canonical matching, base directories, and failure outcomes. Cockpit's
-`pi/tests/subagent-context.test.ts` tests the pinned matcher plus the consumer's
-response validation, inheritance, and aggregate size boundary with transport
-fixtures. These are separate checks, not a single cross-repository end-to-end
-test.
+Tests use Pi's built-in faux provider and isolated scratch directories, with no
+external model calls or real credentials. The suite includes a packed CLI smoke
+test and a ten-second command-timeout check.

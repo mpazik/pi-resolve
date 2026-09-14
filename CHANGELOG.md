@@ -4,9 +4,12 @@
 
 - Initial release of `pi-resolve`.
 - Resolves `@file` and `` !`command` `` references in user input, system
-  prompt, and skill content.
-- Recursive `@file` import in markdown (depth 5), `~/` expansion, 100 KB
-  size caps for files and command output.
+  prompt, skill content, and opted-in extension commands through the
+  `pi-resolve:resolve` shared event.
+- Shared-event callers receive ordered structured outcomes and can select a
+  file-only mode that never executes command references.
+- Single-level `@file` imports, sorted immediate directory listings, `~/`
+  expansion, and 100 KB size caps for files and command output.
 - Settings file at `~/.pi/agent/pi-resolve.json` (global) and
   `<cwd>/.pi/pi-resolve.json` (project, overrides global) with:
   - per-source `files` / `commands` toggles for `userInput`, `systemPrompt`,
@@ -19,3 +22,9 @@
 - Settings validation ignores invalid values and unknown keys with diagnostics
   that do not expose configuration values. Shared calls now use `extension`
   policy rather than `userInput`; migrate shared-call restrictions accordingly.
+- Completed faux-provider SDK tests, saved-transcript checks, and a packed
+  print-mode CLI smoke test replace the abort-before-provider workaround.
+- Commands in expanded prompt templates execute without rerunning commands
+  already captured from typed input. System command output stays inert and is
+  retained across turns without re-execution. Killed commands report failures
+  even when the process exit code is zero.

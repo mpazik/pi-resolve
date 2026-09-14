@@ -1,121 +1,102 @@
-/**
- * In-process end-to-end test: verifies pi-resolve resolves @file and !`command`
- * references inside an expanded skill body.
- *
- * No subprocess, no network, no API key. We import pi as a library, register a
- * mock model provider, load the real pi-resolve extension plus a tiny capture
- * extension, then invoke `/skill:resolve-demo`. The capture extension records
- * the fully-assembled context the model *would* receive and aborts before any
- * provider call, so the assertions run against real resolution output.
- */
-
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { test } from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createHarness, contextTexts } from "./session-harness.ts";
 
-import {
-  AuthStorage,
-  createAgentSession,
-  DefaultResourceLoader,
-  ModelRegistry,
-  SessionManager,
-  type ExtensionAPI,
-} from "@earendil-works/pi-coding-agent";
+const files = {
+  "note.md": "PROJECT_NOTE",
+  "library/z.md": "CHILD_MUST_NOT_BE_READ",
+  "library/a.md": "@secret.md",
+  "library/nested/hidden.md": "NESTED_MUST_NOT_BE_READ",
+  "secret.md": "SECRET_MUST_NOT_BE_ATTACHED",
+};
+const listing = '<file path="library/">\nDirectory listing (immediate entries):\na.md\nnested/\nz.md\n</file>';
 
-import piResolve from "../extensions/z-pi-resolve.ts";
+test("typed prompts preserve text, attach once, keep imports inert, and persist across turns", async (t) => {
+  const h = await createHarness(t, { persist: true, files: {
+    ...files,
+    "import.md": '@secret.md !`touch forbidden`',
+    "output.txt": '@secret.md !`touch forbidden`',
+  } });
+  const prompt = '@note.md @./note.md @library/ @import.md !`printf x >> count; cat output.txt`\n`@secret.md`\n```\n@secret.md !`touch forbidden`\n```';
+  const first = contextTexts(await h.prompt(prompt));
+  assert.ok(first.includes(prompt));
+  assert.equal(first.filter((text) => text.includes("PROJECT_NOTE")).length, 1);
+  assert.ok(first.includes(listing));
+  assert.ok(first.includes('<file path="import.md">\n@secret.md !`touch forbidden`\n</file>'));
+  assert.ok(first.includes('<bash command="printf x >> count; cat output.txt">\n@secret.md !`touch forbidden`\n</bash>'));
+  assert.doesNotMatch(first.join("\n"), /SECRET_MUST_NOT_BE_ATTACHED|CHILD_MUST_NOT_BE_READ|NESTED_MUST_NOT_BE_READ/);
+  const second = contextTexts(await h.prompt('second !`printf x >> count; printf SECOND`'));
+  assert.ok(second.includes(prompt));
+  assert.equal(second.filter((text) => text.includes("PROJECT_NOTE")).length, 1);
+  assert.equal(await readFile(join(h.cwd, "count"), "utf8"), "xx");
+  await assert.rejects(readFile(join(h.cwd, "forbidden")), { code: "ENOENT" });
+  const users = h.session.messages.filter((message) => message.role === "user");
+  assert.deepEqual(users[0]?.content, [{ type: "text", text: prompt }]);
+  const transcript = (await readFile(h.sessionManager.getSessionFile()!, "utf8"))
+    .trim().split("\n").map((line) => JSON.parse(line))
+    .filter((entry) => entry.type === "message").map((entry) => entry.message);
+  assert.deepEqual(transcript, JSON.parse(JSON.stringify(h.session.messages.filter((message) => message.role !== "custom"))));
+  const restored = SessionManager.open(h.sessionManager.getSessionFile()!).buildSessionContext().messages;
+  // Pi stamps custom transcript entries separately from in-memory messages.
+  const withoutTimestamps = (messages: typeof restored) => JSON.parse(JSON.stringify(
+    messages.map(({ timestamp: _timestamp, ...message }) => message),
+  ));
+  assert.deepEqual(withoutTimestamps(restored), withoutTimestamps(h.session.messages));
+  assert.equal(restored.filter((message) => message.role === "custom").length, 2);
+  assert.equal(transcript.filter((message) => message.role === "assistant").length, 2);
+});
 
-const here = dirname(fileURLToPath(import.meta.url));
-const skillDir = join(here, "data", "skills", "resolve-demo");
+test("real skill expansion uses skill files, project commands, trailing args, and substitutions", async (t) => {
+  const h = await createHarness(t, { files: {
+    ...files,
+    ".pi/skills/demo/SKILL.md": '---\nname: demo\ndescription: Resolver fixture\n---\n@note.md @library/ @arg-$0.md\n!`printf x >> skill-count; unset UNSET_FIXTURE; printf "%s" "$ARGUMENTS|$ARGUMENTS[0]|$0|$1|$9|${UNSET_FIXTURE:-fallback}"; pwd`',
+    ".pi/skills/demo/note.md": "SKILL_NOTE",
+    ".pi/skills/demo/arg-alpha.md": "SUBSTITUTED_FILE",
+    ".pi/skills/demo/library/z.md": "CHILD_MUST_NOT_BE_READ",
+    ".pi/skills/demo/library/a.md": "unused",
+    ".pi/skills/demo/library/nested/hidden.md": "unused",
+  } });
+  assert.equal(h.resourceLoader.getSkills().skills[0]?.name, "demo");
+  const texts = contextTexts(await h.prompt("/skill:demo alpha @note.md"));
+  assert.ok(texts.includes('<file path="note.md">\nSKILL_NOTE\n</file>'));
+  assert.ok(texts.includes('<file path="arg-alpha.md">\nSUBSTITUTED_FILE\n</file>'));
+  assert.ok(texts.includes('<file path="note.md">\nPROJECT_NOTE\n</file>'));
+  assert.ok(texts.includes(listing));
+  assert.ok(texts.some((text) => text.includes(`alpha @note.md|alpha|alpha|@note.md||fallback${h.cwd}`)), texts.join("\n"));
+  assert.equal(await readFile(join(h.cwd, "skill-count"), "utf8"), "x");
+  assert.doesNotMatch(texts.join("\n"), /CHILD_MUST_NOT_BE_READ/);
+});
 
-test("skill: @file and !`command` are resolved into the model context", async () => {
-  // Isolate from the developer's real ~/.pi config and project .pi config.
-  const agentDir = mkdtempSync(join(tmpdir(), "pi-resolve-agent-"));
-  const cwd = mkdtempSync(join(tmpdir(), "pi-resolve-cwd-"));
+test("loaded AGENTS context resolves once and command output stays inert", async (t) => {
+  const h = await createHarness(t, { files: {
+    ...files,
+    "AGENTS.md": '@note.md @library/ !`printf x >> system-count; cat output.txt`',
+    "output.txt": '@secret.md !`touch forbidden` SYSTEM_OUTPUT',
+  } });
+  assert.ok(h.resourceLoader.getAgentsFiles().agentsFiles.some((file) => file.path === join(h.cwd, "AGENTS.md")));
+  const first = await h.prompt("first");
+  assert.match(first.systemPrompt!, /SYSTEM_OUTPUT/);
+  assert.ok(contextTexts(first).includes(listing));
+  assert.doesNotMatch(contextTexts(first).join("\n"), /SECRET_MUST_NOT_BE_ATTACHED/);
+  const second = await h.prompt("second");
+  assert.match(second.systemPrompt!, /SYSTEM_OUTPUT/);
+  assert.equal(contextTexts(second).filter((text) => text.includes("PROJECT_NOTE")).length, 1);
+  assert.equal(await readFile(join(h.cwd, "system-count"), "utf8"), "x");
+  await assert.rejects(readFile(join(h.cwd, "forbidden")), { code: "ENOENT" });
+});
 
-  // Captured assembled context (JSON of all messages the model would see).
-  let captured: string | undefined;
-
-  const captureExtension = (pi: ExtensionAPI) => {
-    pi.on("context", async (event, ctx) => {
-      captured = JSON.stringify(event.messages);
-      ctx.abort(); // stop before any real provider/network call
-    });
-  };
-
-  // Mock provider/model: exists so a turn can start; never actually called.
-  const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-  authStorage.setRuntimeApiKey("mock", "x");
-  const modelRegistry = ModelRegistry.inMemory(authStorage);
-  modelRegistry.registerProvider("mock", {
-    name: "Mock",
-    baseUrl: "http://127.0.0.1:1", // unroutable; we abort before reaching it
-    apiKey: "x",
-    api: "anthropic-messages",
-    models: [
-      {
-        id: "mock",
-        name: "Mock",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 100_000,
-        maxTokens: 100,
-      },
-    ],
-  });
-  const model = modelRegistry.find("mock", "mock");
-  assert.ok(model, "mock model should be registered");
-
-  const resourceLoader = new DefaultResourceLoader({
-    cwd,
-    agentDir,
-    additionalSkillPaths: [skillDir],
-    extensionFactories: [piResolve, captureExtension],
-  });
-  await resourceLoader.reload();
-
-  // Sanity: the fixture skill was discovered under the expected name.
-  const skillNames = resourceLoader.getSkills().skills.map((s) => s.name);
-  assert.ok(
-    skillNames.includes("resolve-demo"),
-    `expected resolve-demo skill, got: ${skillNames.join(", ")}`,
-  );
-
-  const { session } = await createAgentSession({
-    cwd,
-    agentDir,
-    model,
-    authStorage,
-    modelRegistry,
-    resourceLoader,
-    sessionManager: SessionManager.inMemory(cwd),
-  });
-
-  try {
-    // prompt() resolves once the turn ends (aborted by the capture extension).
-    await session.prompt("/skill:resolve-demo demo-arg").catch(() => {});
-
-    const haystack = captured ?? JSON.stringify(session.messages);
-
-    assert.match(
-      haystack,
-      /FIXTURE_FILE_RESOLVED_OK/,
-      "@file reference inside the skill was not resolved",
-    );
-    assert.match(
-      haystack,
-      /<file path=\\?"fixture\.md\\?">/,
-      "resolved file should be attached with its baseDir-relative path",
-    );
-    assert.match(
-      haystack,
-      /HELLO_FROM_SKILL_CMD/,
-      "!`command` reference inside the skill was not resolved",
-    );
-  } finally {
-    session.dispose();
-  }
+test("real prompt templates resolve files, directories and substituted commands under userInput policy", async (t) => {
+  const h = await createHarness(t, { files: {
+    ...files,
+    ".pi/prompts/demo.md": '---\ndescription: Resolver fixture\n---\n@note.md @library/ !`printf x >> template-count; printf "$1"`',
+  } });
+  assert.equal(h.resourceLoader.getPrompts().prompts[0]?.name, "demo");
+  const texts = contextTexts(await h.prompt("/demo TEMPLATE_OUTPUT"));
+  assert.ok(texts.includes('<file path="note.md">\nPROJECT_NOTE\n</file>'));
+  assert.ok(texts.includes(listing));
+  assert.ok(texts.includes('<bash command="printf x >> template-count; printf "TEMPLATE_OUTPUT"">\nTEMPLATE_OUTPUT\n</bash>'));
+  assert.equal(await readFile(join(h.cwd, "template-count"), "utf8"), "x");
 });
