@@ -42,7 +42,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { stat, readFile } from "node:fs/promises";
+import { stat, readFile, readdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
@@ -59,6 +59,7 @@ import {
 import {
   SKILL_BLOCK_REGEX,
   extractFileRefs,
+  extractFileReferenceMatches,
   extractCommandRefs,
 } from "./matcher.ts";
 
@@ -66,6 +67,34 @@ import {
 
 type Source = "userInput" | "systemPrompt" | "skill";
 type Display = "always" | "never" | "errors";
+
+export const RESOLVE_REFERENCES_EVENT = "pi-resolve:resolve";
+
+export type ReferenceResolutionStatus =
+  "success" | "missing" | "oversized" | "disabled" | "error";
+
+export interface ReferenceResolution {
+  kind: "file" | "command";
+  reference: string;
+  index: number;
+  status: ReferenceResolutionStatus;
+  resolvedPath?: string;
+  context?: string;
+  reason?: string;
+}
+
+export interface ResolveReferencesResult {
+  context: string[];
+  references: ReferenceResolution[];
+}
+
+export interface ResolveReferencesRequest {
+  version: 1;
+  text: string;
+  baseDir: string;
+  mode?: "all" | "files";
+  response?: Promise<ResolveReferencesResult>;
+}
 
 interface SourceConfig {
   files: boolean;
@@ -119,6 +148,7 @@ interface FileAttachment {
   displayPath: string;
   content: string;
   error?: string;
+  errorCode?: string;
   skipped?: boolean;
 }
 
@@ -142,6 +172,7 @@ interface SkillBlock {
 // ---------- constants ----------
 
 const MAX_FILE_BYTES = 100_000;
+const MAX_DIRECTORY_ENTRIES = 1_000;
 const MAX_BASH_BYTES = 100_000;
 
 // ---------- path resolution ----------
@@ -308,58 +339,107 @@ async function inlineBashRefs(
 
 // ---------- file resolution ----------
 
+async function listDirectory(filepath: string): Promise<string> {
+  const entries = await readdir(filepath, { withFileTypes: true });
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  if (entries.length === 0) return "Directory listing (immediate entries):\n(empty directory)";
+
+  const lines = ["Directory listing (immediate entries):"];
+  const truncationNotice = (omitted: number) =>
+    `[truncated: ${omitted} entries omitted]`;
+  let bytes = Buffer.byteLength(lines[0]!, "utf8");
+  const reservedBytes = Buffer.byteLength(truncationNotice(entries.length), "utf8") + 1;
+  let included = 0;
+  for (const entry of entries) {
+    // Keep unusual filenames on one line without interpreting their contents.
+    const name = /[\r\n\t]/.test(entry.name) ? JSON.stringify(entry.name) : entry.name;
+    const line = `${name}${entry.isDirectory() ? "/" : ""}`;
+    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+    if (included >= MAX_DIRECTORY_ENTRIES || bytes + lineBytes + reservedBytes > MAX_FILE_BYTES) break;
+    lines.push(line);
+    bytes += lineBytes;
+    included++;
+  }
+  if (included < entries.length) lines.push(truncationNotice(entries.length - included));
+  return lines.join("\n");
+}
+
 /** Resolve @file references in text, returning attachments.
  *  Single-level only: @file refs inside resolved file contents are NOT
- *  followed as often leads to errors. 
- *  Resolved content is treated as inert text. 
+ *  followed as often leads to errors.
+ *  Resolved content is treated as inert text.
  */
-async function resolveFileRefs(
-  text: string,
+async function resolveFileReference(
+  name: string,
   baseDir: string,
   source: Source,
-): Promise<FileAttachment[]> {
-  const names = extractFileRefs(text);
-  if (names.length === 0) return [];
-
-  const attachments: FileAttachment[] = [];
-  for (const name of names) {
-    const filepath = resolvePath(name, baseDir);
-
-    try {
-      const stats = await stat(filepath);
-      if (stats.isDirectory()) continue;
-      if (stats.size > MAX_FILE_BYTES) {
-        attachments.push({
-          kind: "file",
-          source,
-          resolvedPath: filepath,
-          displayPath: name,
-          content: "",
-          skipped: true,
-        });
-        continue;
-      }
-      const content = await readFile(filepath, "utf-8");
-      attachments.push({
+): Promise<FileAttachment> {
+  const filepath = resolvePath(name, baseDir);
+  try {
+    const stats = await stat(filepath);
+    if (stats.isDirectory()) {
+      return {
         kind: "file",
         source,
         resolvedPath: filepath,
         displayPath: name,
-        content,
-      });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      attachments.push({
+        content: await listDirectory(filepath),
+      };
+    }
+    if (stats.size > MAX_FILE_BYTES) {
+      return {
         kind: "file",
         source,
         resolvedPath: filepath,
         displayPath: name,
         content: "",
-        error: errMsg,
-      });
+        skipped: true,
+      };
     }
+    const content = await readFile(filepath, "utf-8");
+    if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
+      return {
+        kind: "file",
+        source,
+        resolvedPath: filepath,
+        displayPath: name,
+        content: "",
+        skipped: true,
+      };
+    }
+    return {
+      kind: "file",
+      source,
+      resolvedPath: filepath,
+      displayPath: name,
+      content,
+    };
+  } catch (error) {
+    return {
+      kind: "file",
+      source,
+      resolvedPath: filepath,
+      displayPath: name,
+      content: "",
+      error: error instanceof Error ? error.message : String(error),
+      errorCode:
+        typeof error === "object" && error !== null && "code" in error
+          ? String(error.code)
+          : undefined,
+    };
   }
-  return attachments;
+}
+
+async function resolveFileRefs(
+  text: string,
+  baseDir: string,
+  source: Source,
+): Promise<FileAttachment[]> {
+  return await Promise.all(
+    extractFileRefs(text).map((name) =>
+      resolveFileReference(name, baseDir, source),
+    ),
+  );
 }
 
 // ---------- dedup & format ----------
@@ -376,6 +456,125 @@ function dedup(attachments: FileAttachment[]): FileAttachment[] {
 function formatAttachment(a: FileAttachment): string {
   if (a.error) return `<file path="${a.displayPath}" error="${a.error}" />`;
   return `<file path="${a.displayPath}">\n${a.content}\n</file>`;
+}
+
+function isResolveReferencesRequest(
+  data: unknown,
+): data is ResolveReferencesRequest {
+  if (!data || typeof data !== "object") return false;
+  const request = data as Partial<ResolveReferencesRequest>;
+  return (
+    request.version === 1 &&
+    typeof request.text === "string" &&
+    typeof request.baseDir === "string"
+  );
+}
+
+async function resolveReferencesForExtension(
+  request: ResolveReferencesRequest,
+  pi: ExtensionAPI,
+  settings: Settings,
+): Promise<ResolveReferencesResult> {
+  const config = cfgFor(settings, "userInput");
+  const candidates = [
+    ...extractFileReferenceMatches(request.text).map((reference) => ({
+      kind: "file" as const,
+      ...reference,
+    })),
+    ...extractCommandRefs(request.text).map((reference) => ({
+      kind: "command" as const,
+      ...reference,
+    })),
+  ].sort((left, right) => left.index - right.index);
+  const references: ReferenceResolution[] = [];
+
+  for (const candidate of candidates) {
+    if (candidate.kind === "file") {
+      if (!config.files) {
+        references.push({
+          kind: "file",
+          reference: candidate.path,
+          index: candidate.index,
+          status: "disabled",
+          reason: "file resolution is disabled",
+        });
+        continue;
+      }
+      const attachment = await resolveFileReference(
+        candidate.path,
+        request.baseDir,
+        "userInput",
+      );
+      const context =
+        !attachment.skipped && !attachment.error
+          ? formatAttachment(attachment)
+          : undefined;
+      references.push({
+        kind: "file",
+        reference: candidate.path,
+        index: candidate.index,
+        resolvedPath: attachment.resolvedPath,
+        status: attachment.skipped
+          ? "oversized"
+          : attachment.errorCode === "ENOENT"
+            ? "missing"
+            : attachment.error
+              ? "error"
+              : "success",
+        ...(context ? { context } : {}),
+        ...(attachment.skipped
+          ? { reason: `file exceeds ${MAX_FILE_BYTES} bytes` }
+          : attachment.error
+            ? { reason: attachment.error }
+            : {}),
+      });
+      continue;
+    }
+
+    if (request.mode === "files" || !config.commands) {
+      references.push({
+        kind: "command",
+        reference: candidate.command,
+        index: candidate.index,
+        status: "disabled",
+        reason:
+          request.mode === "files"
+            ? "command execution is disabled in file-only mode"
+            : "command resolution is disabled",
+      });
+      continue;
+    }
+    const { inlines } = await inlineBashRefs(
+      candidate.fullMatch,
+      request.baseDir,
+      pi,
+      "userInput",
+    );
+    const inline = inlines[0]!;
+    const context =
+      !inline.skipped && !inline.error
+        ? `<bash command="${inline.command}">\n${inline.output}\n</bash>`
+        : undefined;
+    references.push({
+      kind: "command",
+      reference: candidate.command,
+      index: candidate.index,
+      status: inline.skipped ? "oversized" : inline.error ? "error" : "success",
+      ...(context ? { context } : {}),
+      ...(inline.skipped
+        ? { reason: `command output exceeds ${MAX_BASH_BYTES} bytes` }
+        : inline.error
+          ? { reason: inline.error }
+          : {}),
+    });
+  }
+
+  return {
+    context: references.flatMap((reference) =>
+      reference.context ? [reference.context] : [],
+    ),
+    references,
+  };
 }
 
 // ---------- display ----------
@@ -453,6 +652,14 @@ export default function (pi: ExtensionAPI) {
   // Bash inlines captured from the input event. User text is kept as-is;
   // outputs are attached as a separate context message in before_agent_start.
   let pendingUserInlines: BashInline[] = [];
+
+  // Extension commands bypass Pi's input and before_agent_start hooks. Expose
+  // the same user-input resolution through the shared event bus so commands
+  // that make their own model calls can opt in.
+  pi.events.on(RESOLVE_REFERENCES_EVENT, (data) => {
+    if (!isResolveReferencesRequest(data) || data.response) return;
+    data.response = resolveReferencesForExtension(data, pi, settings);
+  });
 
   pi.registerMessageRenderer<ContextDetails>(
     "context",
