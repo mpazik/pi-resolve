@@ -4,14 +4,14 @@ Give [Pi](https://pi.dev) instant context from files and shell commands.
 
 ![Pi resolving file and command references in a prompt](.github/media/pi-resolve.png)
 
-Pi receives the files and command output before it responds, saving the time and
+Pi receives the files and command output before the agent responds, saving the time and
 token overhead of extra tool calls. Your prompt stays unchanged, with file and
-command status shown in Pi's conversation UI.
+command status shown in Pi's UI.
 
 ## Dynamic project context
 
-Reference source documents and generate changing details directly in your project
-instructions:
+With pi-resolve, `AGENTS.md` can reference source documents and generate context
+with shell commands.
 
 - **Less maintenance:** update source documents, not copies in your instructions.
   Generate indexes instead of maintaining them by hand.
@@ -20,33 +20,28 @@ instructions:
 - **Less token overhead:** skip the requests and tool-call exchanges needed to
   collect that context.
 
-For example, add this to `AGENTS.md`, outside a code fence. Pi receives the current
-file contents and command output on the first turn of each session:
-
 ```markdown
 Architecture: @docs/architecture.md
 Coding conventions: @docs/conventions.md
 
-Available guides (excluding disabled documents):
-!`for doc in docs/*.md; do [ -f "$doc" ] || continue; DOC="$doc" yq -f extract 'select(.disabled != true) | [strenv(DOC), .description] | @tsv' "$doc"; done`
+Active guides:
+!`find docs -type f -name '*.md' -exec env DOC={} yq -f extract 'select(.status == "active") | [strenv(DOC), .description] | @tsv' {} \;`
 ```
 
-This example requires [yq](https://github.com/mikefarah/yq) and Markdown guides
-with YAML frontmatter. It lists their paths and `description` fields, excluding
-those with `disabled: true`, without loading their bodies.
+Here, Pi receives the contents of the architecture and conventions files and a
+guide index that includes only paths and descriptions for active guides
+(requires [yq](https://github.com/mikefarah/yq)).
+
+References also work in **skills and prompt templates**. Other extensions can opt
+in through the [shared resolver](#extension-integration).
 
 ## Install
-
-Requires **Pi 0.85.1 through 0.85.x**, **Node.js 26**, and a POSIX `sh` for commands.
 
 ```bash
 pi install npm:pi-resolve
 ```
 
 Start a new Pi session after installing.
-
-If another extension adds references to the system prompt, load pi-resolve after
-it so those references are available when resolution runs.
 
 ## Usage
 
@@ -99,8 +94,8 @@ responds. The next unescaped backtick ends the expression. Escape a backtick
 inside the command with a backslash; shell escapes are passed to `sh` unchanged.
 Prefer `$(...)` for shell substitutions.
 
-**Commands run with your user permissions. Only use commands and project
-instructions you trust.** Output limits do not undo command effects: a command
+**Commands run with your user permissions.** Only use commands and project
+instructions you trust. Output limits do not undo command effects: a command
 can modify files or contact services even if its output is too large to include.
 
 ### Literal references
@@ -124,8 +119,10 @@ an even run does not.
 These are configurable defaults. Files include directory listings.
 
 Prompts and templates resolve each turn. System context resolves on the first
-turn of the session, not continuously. Skill references resolve after argument
-substitution, with file paths relative to the skill directory. Commands still run
+turn of the session, not continuously.
+
+Skill references resolve after argument substitution, with file paths relative
+to the skill directory. Commands still run
 in the project directory. References you type as arguments keep direct-prompt
 settings and paths.
 
@@ -187,11 +184,16 @@ settings are trusted: they can re-enable commands disabled in global settings.
 Byte limits are positive integers and do not cap your prompt or history.
 `commandTimeoutMs` accepts integers from 1 to 2,147,483,647 milliseconds. Timed-out
 commands are terminated; partial output is not attached.
+
 Imports that exceed the total budget are omitted, not cut off. Direct input takes
 priority, then system context, then templates or skills. Directory listings can
 truncate at their per-file limit or 1,000 entries, with an omitted-entry count.
 
 ## Extension integration
+
+System-prompt references added by another extension are resolved only if its
+hook runs before pi-resolve's. Use the shared resolver below to avoid relying on
+hook order.
 
 Extension commands bypass Pi's input hooks. To resolve their references, emit
 `pi-resolve:resolve` with `{ version: 1, text, baseDir, mode? }`. pi-resolve sets
@@ -204,7 +206,8 @@ Extension commands bypass Pi's input hooks. To resolve their references, emit
 
 `mode` is `"all"` or `"files"`. Shared calls use `sources.extension` (files enabled,
 commands disabled by default); `"files"` mode can further restrict permissions,
-never enable them. The caller attaches results and owns the UI feedback.
+never enable them. Commands run in `baseDir`. The caller attaches results and
+owns the UI feedback.
 
 Check that `request.response` exists before awaiting it: no response means the
 resolver is unavailable. Check each result before using it, so a missing file or
@@ -212,7 +215,7 @@ failed command is reported rather than silently left out of the model's context.
 
 ## Development
 
-Use Node.js 26. From a checkout:
+From a checkout:
 
 ```bash
 npm install
