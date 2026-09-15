@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import type { Context } from "@earendil-works/pi-ai";
-import { contextTexts } from "./session-harness.ts";
-import { createWorkspace } from "./workspace-harness.ts";
+import { contextTexts } from "./fixtures/session.mock.ts";
+import { createWorkspace } from "./fixtures/workspace.mock.ts";
 
 const exec = promisify(execFile);
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -26,7 +26,11 @@ test("packed installation is discovered by the actual print CLI and reaches a co
   await writeFile(join(root, "npmrc"), "");
   await writeFile(join(root, "global-npmrc"), "");
   const packed = await exec("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", root], { cwd: repo, env, timeout: 20_000 });
-  const [{ filename }] = JSON.parse(packed.stdout);
+  const [{ filename, files }] = JSON.parse(packed.stdout);
+  assert.deepEqual(files.map((file: { path: string }) => file.path).sort(), [
+    "CHANGELOG.md", "LICENSE", "README.md", "package.json",
+    "src/matcher.ts", "src/pi-resolve.ts", "src/settings.ts",
+  ]);
   // Install the tarball without registry access or peer installation. Pi supplies
   // extension dependencies through its loader, as it does for published packages.
   await exec("npm", ["install", "--offline", "--ignore-scripts", "--legacy-peer-deps", "--no-audit", "--no-fund", join(root, filename)], {
@@ -34,7 +38,7 @@ test("packed installation is discovered by the actual print CLI and reaches a co
   });
   const installed = join(root, "install/node_modules/pi-resolve");
   const manifest = JSON.parse(await readFile(join(installed, "package.json"), "utf8"));
-  assert.deepEqual(manifest.pi.extensions, ["./extensions/z-pi-resolve.ts"]);
+  assert.deepEqual(manifest.pi.extensions, ["./src/pi-resolve.ts"]);
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [installed], retry: { enabled: false }, compaction: { enabled: false } }));
   await writeFile(join(cwd, "note.md"), "PACKED_CONTEXT");
   await mkdir(join(cwd, "library"));
@@ -44,7 +48,7 @@ test("packed installation is discovered by the actual print CLI and reaches a co
   const cli = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/index\.js$/, "cli.js");
   const running = exec(process.execPath, [cli,
     "--print", "--no-session", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
-    "--extension", join(repo, "tests/data/cli-provider.ts"),
+    "--extension", join(repo, "tests/fixtures/provider.mock.ts"),
     "--provider", "resolve-test", "--model", "faux-1",
     'Resolve @note.md @library/ !`printf x >> count; printf CLI_OUTPUT`',
   ], { cwd, env: { ...env, PI_RESOLVE_TEST_CAPTURE: capture }, timeout: 20_000 });

@@ -32,6 +32,8 @@
   policy rather than `userInput`; migrate shared-call restrictions accordingly.
 - Completed faux-provider SDK tests, saved-transcript checks, and a packed
   print-mode CLI smoke test replace the abort-before-provider workaround.
+- Package sources now live in `src/` and load directly without a build step.
+  Matcher consumers should import `pi-resolve/src/matcher.ts`.
 - Opted-in commands in expanded prompt templates execute without rerunning
   commands already captured from typed input. System command output stays inert and is
   retained across turns without re-execution. Killed commands report failures

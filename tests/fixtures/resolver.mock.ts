@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import piResolve, { RESOLVE_REFERENCES_EVENT, type ResolveReferencesRequest } from "../extensions/z-pi-resolve.ts";
-import { createWorkspace } from "./workspace-harness.ts";
+import piResolve, { RESOLVE_REFERENCES_EVENT, type ResolveReferencesRequest } from "../../src/pi-resolve.ts";
+import { createWorkspace } from "./workspace.mock.ts";
 
 /** Lightweight extension host for shared-event contracts and controlled OS races.
  * Direct hook access is retained for loader and concurrency regression checks.

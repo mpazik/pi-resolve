@@ -1,6 +1,6 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { RESOLVE_REFERENCES_EVENT, type ResolveReferencesRequest } from "../../extensions/z-pi-resolve.ts";
+import { RESOLVE_REFERENCES_EVENT, type ResolveReferencesRequest } from "../../src/pi-resolve.ts";
 
 /** Callers explicitly own propagation. The resolver does not send messages. */
 export default function consumerExtension(pi: ExtensionAPI) {

@@ -10,8 +10,8 @@ import {
   fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryModelsStore,
   type Context, type FauxResponseStep,
 } from "@earendil-works/pi-ai";
-import piResolve from "../extensions/z-pi-resolve.ts";
-import { createWorkspace } from "./workspace-harness.ts";
+import piResolve from "../../src/pi-resolve.ts";
+import { createWorkspace } from "./workspace.mock.ts";
 
 /** Real SDK/resources/processes. Only the model response is synthetic. */
 export async function createHarness(t: TestContext, options: {

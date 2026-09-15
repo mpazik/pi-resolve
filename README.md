@@ -88,7 +88,7 @@ file outcomes and incompatible responses, including a success without a string
 
 ### Matcher-only consumers
 
-`extractFileRefs` from `pi-resolve/extensions/matcher.ts` is the canonical pure
+`extractFileRefs` from `pi-resolve/src/matcher.ts` is the canonical pure
 matcher. It does not load the extension, read files, or execute commands. Use it
 instead of a second regex when detecting whether the shared resolver is needed.
 

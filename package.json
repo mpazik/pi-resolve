@@ -16,14 +16,14 @@
     "url": "https://github.com/mpazik/pi-resolve"
   },
   "files": [
-    "extensions",
+    "src",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": [
-      "./extensions/z-pi-resolve.ts"
+      "./src/pi-resolve.ts"
     ]
   },
   "peerDependencies": {
