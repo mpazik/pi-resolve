@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## Unreleased
+
+- Add manual patch/minor releases with changelog-driven release notes and npm
+  publishing after CI and packed-package checks.
+
+## 0.1.0 (2026-09-15)
 
 - Initial release of `pi-resolve`.
 - Resolve `@file` and `` !`command` `` references in user input, system

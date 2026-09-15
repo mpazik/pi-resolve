@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment (notes come from CHANGELOG.md Unreleased)
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.repository == 'mpazik/pi-resolve' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  prepare:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.commit.outputs.commit }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Reject a stale release request
+        run: |
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA" || {
+            echo 'main changed while checks ran. Start a new release run.' >&2
+            exit 1
+          }
+      - name: Bump version and finalize changelog
+        id: release
+        env:
+          RELEASE_BUMP: ${{ inputs.bump }}
+        run: node scripts/release.ts "$RELEASE_BUMP" >> "$GITHUB_OUTPUT"
+      - name: Commit and tag release
+        id: commit
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json package-lock.json CHANGELOG.md
+          git commit -m "Release $RELEASE_TAG"
+          git tag "$RELEASE_TAG"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # A concurrent main update or existing tag rejects the entire push.
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$RELEASE_TAG"
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 26
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm ci
+      - name: Check for an already completed npm publication
+        id: registry
+        run: |
+          node --input-type=module >> "$GITHUB_OUTPUT" <<'NODE'
+          import assert from 'node:assert/strict';
+          const response = await fetch(`https://registry.npmjs.org/pi-resolve/${process.env.RELEASE_VERSION}`, {
+            signal: AbortSignal.timeout(30_000),
+          });
+          if (response.status === 404) {
+            console.log('published=false');
+          } else {
+            assert(response.ok, `npm registry returned ${response.status}`);
+            const pkg = await response.json();
+            assert.equal(pkg.gitHead, process.env.RELEASE_COMMIT, 'Published version belongs to a different commit');
+            console.log('published=true');
+          }
+          NODE
+      # prepublishOnly runs typecheck and all tests, including packed CLI checks.
+      - run: npm publish --provenance --access public
+        if: steps.registry.outputs.published == 'false'
+      - name: Publish GitHub release from changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release.ts notes "$RELEASE_VERSION" > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "GitHub release $RELEASE_TAG already exists."
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "$RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" --latest
+          fi
