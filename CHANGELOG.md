@@ -10,7 +10,12 @@
   file-only mode that never executes command references.
 - Single-level `@file` imports, sorted immediate directory listings, and `~/`
   expansion. Configurable byte limits default to 100 KB per file or command
-  capture and 1 MB total imported context per turn or shared request.
+  capture and 1 MB total imported context per turn or shared request. Command
+  deadlines are configurable through `limits.commandTimeoutMs` (default 10,000 ms).
+- Leading backslashes suppress file and command references. Escaped backticks
+  inside commands no longer end the expression prematurely; shell escapes remain
+  unchanged. Bare names still require a dot or slash to qualify as paths.
+- Context status rows use Pi's standard spacing without an extra leading blank row.
 - Byte-bounded reads and subprocess capture reject special files, stop flooding
   output, and clean up POSIX process groups. Failed or omitted references produce
   explicit model-facing notices independently of TUI display.

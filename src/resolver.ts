@@ -84,7 +84,7 @@ function charge(budget: Budget, text: string): boolean {
 }
 
 /** Bound raw stdout + stderr bytes before decoding or trimming either stream. */
-function captureCommand(command: string, cwd: string, maxBytes: number): Promise<{
+function captureCommand(command: string, cwd: string, maxBytes: number, timeoutMs: number): Promise<{
   stdout: string;
   stderr: string;
   code: number | null;
@@ -118,7 +118,7 @@ function captureCommand(command: string, cwd: string, maxBytes: number): Promise
     const timer = setTimeout(() => {
       killed = true;
       stop();
-    }, 10_000);
+    }, timeoutMs);
     const capture = (chunks: Buffer[]) => (chunk: Buffer) => {
       if (oversized || killed) return;
       if (chunk.length > maxBytes - bytes) {
@@ -156,11 +156,11 @@ function resolvePath(name: string, baseDir: string): string {
 }
 
 async function resolveCommand(
-  command: string, cwd: string, source: Source, maxBytes: number,
+  command: string, cwd: string, source: Source, maxBytes: number, timeoutMs: number,
 ): Promise<BashInline> {
   const item: BashInline = { kind: "bash", source, command, output: "" };
   try {
-    const result = await captureCommand(command, cwd, maxBytes);
+    const result = await captureCommand(command, cwd, maxBytes, timeoutMs);
     const stdout = result.stdout.trimEnd();
     if (result.oversized || Buffer.byteLength(stdout, "utf8") > maxBytes) {
       return { ...item, skipped: true };
@@ -310,7 +310,9 @@ async function captureCommandReference(
   const empty: BashInline = { kind: "bash", source, command, output: "" };
   const available = remaining - Buffer.byteLength(importedText(empty), "utf8");
   if (available <= 0) return { ...empty, skipped: true, budgetExceeded: true };
-  const item = await resolveCommand(command, cwd, source, Math.min(limits.maxCommandBytes, available));
+  const item = await resolveCommand(
+    command, cwd, source, Math.min(limits.maxCommandBytes, available), limits.commandTimeoutMs,
+  );
   if (item.skipped) item.budgetExceeded = available < limits.maxCommandBytes;
   return item;
 }

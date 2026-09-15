@@ -7,7 +7,6 @@ import {
   getCapabilities,
   hyperlink,
   Loader,
-  Spacer,
   Text,
 } from "@earendil-works/pi-tui";
 import {
@@ -155,7 +154,6 @@ export default function (pi: ExtensionAPI): void {
       const items = message.details?.items ?? [];
       if (items.length === 0) return undefined;
       const container = new Container();
-      container.addChild(new Spacer(1));
       for (const item of items) {
         const badge = item.kind === "file"
           ? theme.inverse(theme.fg("accent", " file "))

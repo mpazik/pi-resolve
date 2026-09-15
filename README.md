@@ -1,139 +1,145 @@
 # pi-resolve
 
-Attach file contents and shell-command output to your [Pi](https://pi.dev) prompts before the agent responds.
+Give [Pi](https://pi.dev) instant context from files and shell commands.
 
-```text
-Review @src/parser.ts against @docs/syntax.md.
+![Pi resolving file and command references in a prompt](.github/media/pi-resolve.png)
 
-Current changes:
-!`git diff -- src/parser.ts`
-```
-
-Pi receives the files and command output alongside your prompt, without needing
-to request them through tools. Your original text stays visible, with a context
-summary showing what was attached.
+Pi receives the files and command output before it responds, saving the time and
+token overhead of extra tool calls. Your prompt stays unchanged, with file and
+command status shown in Pi's conversation UI.
 
 ## Dynamic project context
 
 Reference source documents and generate changing details directly in your project
 instructions:
 
+- **Less maintenance:** update source documents, not copies in your instructions.
+  Generate indexes instead of maintaining them by hand.
+- **Less waiting:** context is ready before the agent starts, without extra read
+  or shell tool calls.
+- **Less token overhead:** skip the requests and tool-call exchanges needed to
+  collect that context.
+
+For example, add this to `AGENTS.md`, outside a code fence. Pi receives the current
+file contents and command output on the first turn of each session:
+
 ```markdown
 Architecture: @docs/architecture.md
 Coding conventions: @docs/conventions.md
 
-Current project layout:
-!`git ls-files src`
+Available guides (excluding disabled documents):
+!`for doc in docs/*.md; do [ -f "$doc" ] || continue; DOC="$doc" yq -f extract 'select(.disabled != true) | [strenv(DOC), .description] | @tsv' "$doc"; done`
 ```
 
-Put this in `AGENTS.md`, outside a code fence. On the first turn of each session,
-Pi receives the current contents and command output.
-
-- **Less maintenance:** update the source documents, not copies in your
-  instructions. Generate the project layout instead of maintaining it by hand.
-- **Less waiting:** context is ready before the agent starts, without extra read
-  or shell tool calls.
-- **Less token overhead:** skip the requests and tool-call exchanges needed to
-  collect that context. The imported content still uses tokens, so include what
-  the agent routinely needs.
+This example requires [yq](https://github.com/mikefarah/yq) and Markdown guides
+with YAML frontmatter. It lists their paths and `description` fields, excluding
+those with `disabled: true`, without loading their bodies.
 
 ## Install
+
+Requires **Pi 0.85.1 through 0.85.x**, **Node.js 26**, and a POSIX `sh` for commands.
 
 ```bash
 pi install npm:pi-resolve
 ```
 
-Start a new Pi session after installing. Requires Node.js 26 and Pi 0.85.1
-through 0.85.x. Shell commands require a POSIX `sh`.
+Start a new Pi session after installing.
+
+If another extension adds references to the system prompt, load pi-resolve after
+it so those references are available when resolution runs.
 
 ## Usage
 
+Resolution is single-level: references inside imported files or command output
+remain text. A command that lists filenames does not attach those files.
+
 ### Files
 
-Use `@path` to attach a file, or several files in the same prompt:
+Use `@path/to/file` to attach a file, or several files in the same prompt:
 
 ```text
-Check that @src/parser.ts follows @docs/syntax.md and @docs/style.md.
+Check @src/parser.ts against @docs/style.md.
 ```
 
+The name after `@` must contain a **dot or slash**, not necessarily a file
+extension. `@README.md`, `@.gitignore`, and `@src/README` all work. Use
+`@./LICENSE` for a root-level extensionless file. Bare words such as `@LICENSE`
+and `@alice` are ignored to avoid treating mentions and tags as files.
+
 Paths are relative to the project working directory. Absolute paths and `~/`
-paths also work. Bare names such as `@LICENSE` are ignored to avoid matching
-mentions and tags; use `@./LICENSE` for extensionless files.
+paths also work. Escape spaces or brackets in filenames, for example
+`@./My\ Notes.md` or `@./a\(b\).txt`. Without escaping, whitespace, quotes,
+commas, semicolons, and brackets end a path.
 
 ### Directories
 
-Use a directory reference to attach a listing of its immediate entries:
+Use `@tests/` to give Pi a listing of that directory, for example:
 
 ```text
-Where should a new parser test go? Here are the existing tests: @tests/
+Directory listing (immediate entries):
+.gitkeep
+fixtures/
+parser.test.ts
 ```
 
-Listings are sorted and include hidden entries. Subdirectories are marked with
-`/`, and empty directories are explicitly labeled. This does not read the files
-or recurse into subdirectories. Only regular files and directory listings are
-supported.
+Only entry names are included, not file contents or nested listings. Entries are
+sorted, hidden entries are included, and subdirectories end in `/`. Empty
+directories are labeled `(empty directory)`.
 
 ### Commands
 
 Wrap a shell command in `` !`…` `` to attach its standard output:
 
 ```text
-Summarize the changes on this branch:
-!`git diff --stat origin/main...HEAD`
+Review my changes: !`git diff`
 ```
 
-Commands run through POSIX `sh -c` in the project working directory. They execute
-before the agent responds, not at the agent's discretion. Shell quoting applies
-inside the backticks. The command itself cannot contain a backtick, since that
-closes the expression; use `$(...)` for nested substitutions or a heredoc.
+Commands run through `sh -c` in the project working directory, before the agent
+responds. The next unescaped backtick ends the expression. Escape a backtick
+inside the command with a backslash; shell escapes are passed to `sh` unchanged.
+Prefer `$(...)` for shell substitutions.
 
 **Commands run with your user permissions. Only use commands and project
-instructions you trust.**
+instructions you trust.** Output limits do not undo command effects: a command
+can modify files or contact services even if its output is too large to include.
 
-### Sources and timing
+### Literal references
 
-These are the defaults; each source can be configured separately.
+Inline code and fenced code blocks suppress resolution. Use double backticks to
+wrap a command expression: ```` `` !`git diff` `` ````.
 
-| Source | Setting | Files and directories | Commands | Display |
+A leading backslash also keeps a reference literal: `\@file.md` or
+`` \!`git diff` ``. Backslashes pair off: an odd run escapes the marker;
+an even run does not.
+
+### Supported inputs
+
+| Source | Setting | Files | Commands | UI feedback |
 |---|---|:---:|:---:|---|
-| Direct prompts | `userInput` | Yes | Yes | `always` |
-| Prompt templates | `template` | Yes | No | `always` |
-| System prompt, including `AGENTS.md` | `systemPrompt` | Yes | Yes | `never` |
-| Skill commands | `skill` | Yes | No | `never` |
+| Direct prompts | `userInput` | Yes | Yes | All |
+| Prompt templates | `template` | Yes | No | All |
+| System prompt, including `AGENTS.md` | `systemPrompt` | Yes | Yes | Hidden |
+| Skill commands | `skill` | Yes | No | Hidden |
 
-Direct prompts and templates resolve each turn. System-prompt references resolve
-on the first turn of the session. They are a snapshot, not a live view of changes
-made during the conversation. Successful system-command output is inserted into
-the system prompt and reapplied on later turns without rerunning the command.
+These are configurable defaults. Files include directory listings.
 
-Skills resolve after argument substitution. File paths authored in a skill are
-relative to its directory; shell commands still run in the project working
-directory. References supplied as arguments retain direct-input policy through
-expansion, including repeated substitutions, and direct-input file paths use the
-project working directory. Without an expansion source map, an identical
-reference authored in a template is also treated as direct input.
+Prompts and templates resolve each turn. System context resolves on the first
+turn of the session, not continuously. Skill references resolve after argument
+substitution, with file paths relative to the skill directory. Commands still run
+in the project directory. References you type as arguments keep direct-prompt
+settings and paths.
 
-Pi runs extension hooks in load order. To resolve system-prompt references added
-by another extension, pi-resolve must run after it on the first turn. It does not
-enforce last position; filename prefixes such as `z-` do not guarantee load order.
+Other extensions must opt into the shared resolver below. Arbitrary tool inputs
+and outputs are not automatically resolved.
 
-Extension commands can opt in through the shared resolver described below.
-Arbitrary tool inputs and outputs are not automatically resolved.
+## Settings
 
-## Configuration
+Settings are optional and loaded at session start:
 
-Settings live in their own file, not Pi's `settings.json`:
+- Global: `~/.pi/agent/pi-resolve.json` (or in Pi's configured agent directory).
+- Project: `.pi/pi-resolve.json` in the working directory.
 
-- Global: `~/.pi/agent/pi-resolve.json`, or `pi-resolve.json` in Pi's configured
-  agent directory.
-- Project: `<cwd>/.pi/pi-resolve.json`.
-
-No configuration is needed to start. Settings are loaded at session start; start
-a new session after changing them. The file must contain JSON, without comments
-or trailing commas. Omit fields to keep their defaults.
-
-For example, enable commands authored in prompt templates and show system-context
-summaries:
+For example, enable template commands and show system-context feedback in Pi:
 
 ```json
 {
@@ -144,180 +150,65 @@ summaries:
   "limits": {
     "maxFileBytes": 100000,
     "maxCommandBytes": 100000,
-    "maxTotalBytes": 1000000
+    "maxTotalBytes": 1000000,
+    "commandTimeoutMs": 10000
   }
 }
 ```
 
-### Source controls
+Each entry in `sources`, or the shared `defaults` object, accepts:
 
-`defaults` and each entry in `sources` accept:
-
-| Field | Meaning |
+| Setting | Meaning |
 |---|---|
-| `files` | Enable file contents and directory listings. |
-| `commands` | Enable shell-command execution. |
-| `display` | Choose which results appear in the context summary. |
+| `files` | Attach file contents and directory listings. |
+| `commands` | Run command references and include their output. |
+| `display` | Show file/command status rows in Pi's conversation UI: `"always"`, `"errors"` (errors and skipped items only), or `"never"`. |
 
-Set both `files` and `commands` to `false` to disable resolution for a source.
-The built-in defaults are `files: true`, `commands: true`, and `display: "always"`,
-with the source overrides shown in the table above. Shared API calls use the
-additional `extension` source, with files enabled and commands disabled by default.
+UI feedback includes the path or command, line count, and any error. Hiding it
+with `display` does not remove content sent to the model, including notices for
+failed or oversized imports. Set both `files` and `commands` to `false` to disable
+a source.
 
-Display values:
-
-- `"always"`: show every resolved item, including errors and skipped items.
-- `"errors"`: show only errors and skipped items.
-- `"never"`: do not show items from this source.
-
-The summary shows labels, line counts, and errors. If filtering leaves no items,
-the summary is omitted. Display does not control content sent to the model.
-
-### Precedence and validation
-
-Settings merge per field, in this order from lowest to highest priority:
-
-1. Built-in policy for the source.
-2. Global `defaults`.
-3. Project `defaults`.
-4. Global `sources.<source>`.
-5. Project `sources.<source>`.
-
-Missing fields inherit. Source-specific settings are more specific than defaults,
-including project defaults. For example, global `sources.skill.commands: false`
-remains disabled when a project only sets `sources.skill.display: "never"`.
-
-Limits also merge per field, with project values overriding global values.
-
-Invalid JSON or unreadable settings files are ignored with a warning. Invalid
-object shapes, field types, display values, and unknown keys are warned about
-and ignored; valid fields still apply. Diagnostics do not include setting values.
+Omitted values keep the defaults shown above. Project settings override global
+settings per field; source-specific settings override `defaults` from either
+file. Invalid settings are ignored with a warning. Use plain JSON without
+comments or trailing commas, and start a new session after changes. Project
+settings are trusted: they can re-enable commands disabled in global settings.
 
 ### Limits
 
-All limits are positive integer byte counts.
-
 | Setting | Default | Applies to |
 |---|---:|---|
-| `maxFileBytes` | 100,000 | Each file or directory listing. |
-| `maxCommandBytes` | 100,000 | Combined stdout/stderr capture for each command. |
-| `maxTotalBytes` | 1,000,000 | Successful imported context per turn or shared request. |
+| `maxFileBytes` | 100,000 bytes | Each file or directory listing. |
+| `maxCommandBytes` | 100,000 bytes | Combined stdout/stderr for each command. |
+| `maxTotalBytes` | 1,000,000 bytes | Imported context per turn or shared request, including wrappers and cached system output. |
+| `commandTimeoutMs` | 10,000 ms | Execution time for each command, including shared-resolver calls. |
 
-Directory listings also have a 1,000-entry cap. Truncated listings include a
-notice showing how many entries were omitted.
-
-The total budget includes attachment wrappers and system-command output. Cached
-system output counts when reapplied; historical attachments do not count again.
-The original prompt and conversation history are not capped. Failure notices
-remain available even when the budget is exhausted.
-
-References use the budget in this order: direct input, system context, then
-expanded templates or skills. Within each source, source-text order wins. A
-reference that does not fit is omitted rather than silently cut off. Directory
-listings can truncate at their per-file limit; the total limit never further
-shortens a listing.
-
-## Behavior and safety
-
-### Escaping
-
-Inline code spans and fenced code blocks suppress resolution. To write a literal
-file reference, wrap it in backticks. For a command expression that already
-contains backticks, use a double-backtick code span:
-
-````markdown
-`@path/to/file.md`
-`` !`git status` ``
-````
-
-Inside a path, `\<char>` collapses to `<char>`. Otherwise, a path stops at
-whitespace, quotes, commas, semicolons, or brackets.
-
-| Written | Resolved path |
-|---|---|
-| `@./My\ Notes.md` | `./My Notes.md` |
-| `@~/dir\,with\,commas/x.md` | `~/dir,with,commas/x.md` |
-| `@./a\(b\).txt` | `./a(b).txt` |
-
-Backslash escaping only works inside a path. `\@file.md` still resolves.
-
-### Imported content and failures
-
-Resolution is single-level. References inside imported files or command output
-remain text. A command that lists filenames does not attach those files.
-
-Failed or oversized references produce explicit failure notices for the model
-instead of content, regardless of display settings.
-
-### Command execution
-
-Commands time out after ten seconds. Background processes in their POSIX process
-group are terminated when the shell exits.
-
-System prompts, `AGENTS.md`, and project settings are trusted configuration.
-Project settings can enable commands disabled by global settings. `AGENTS.md`
-shares the `systemPrompt` policy, which enables commands by default.
-
-Limits are not a sandbox. A command may already have run before its output is
-rejected.
+Byte limits are positive integers and do not cap your prompt or history.
+`commandTimeoutMs` accepts integers from 1 to 2,147,483,647 milliseconds. Timed-out
+commands are terminated; partial output is not attached.
+Imports that exceed the total budget are omitted, not cut off. Direct input takes
+priority, then system context, then templates or skills. Directory listings can
+truncate at their per-file limit or 1,000 entries, with an omitted-entry count.
 
 ## Extension integration
 
-Extension commands bypass Pi's input hooks. Commands that make their own model
-calls can opt into resolution through the `pi-resolve:resolve` shared event.
+Extension commands bypass Pi's input hooks. To resolve their references, emit
+`pi-resolve:resolve` with `{ version: 1, text, baseDir, mode? }`. pi-resolve sets
+`request.response` to a promise containing:
 
-### Shared resolver
+- `context`: ordered strings ready to include in the model's context.
+- `references`: results with `kind`, `reference`, source offset `index`, and
+  `status` (`success`, `missing`, `oversized`, `disabled`, or `error`). Successful
+  results include `context`; results may also include `resolvedPath` and `reason`.
 
-The request contains:
+`mode` is `"all"` or `"files"`. Shared calls use `sources.extension` (files enabled,
+commands disabled by default); `"files"` mode can further restrict permissions,
+never enable them. The caller attaches results and owns the UI feedback.
 
-| Field | Value |
-|---|---|
-| `version` | `1` |
-| `text` | Text containing references to resolve. |
-| `baseDir` | Base directory for file paths and command execution. |
-| `mode` | Optional: `"all"` or `"files"`. |
-
-pi-resolve sets `request.response` to a promise containing:
-
-- `context`: ordered strings of resolved context.
-- `references`: one structured result for every reference.
-
-Each result has `kind` (`"file"` or `"command"`), `reference`, the source offset
-`index`, and a `status`: `"success"`, `"missing"`, `"oversized"`, `"disabled"`, or
-`"error"`. Results can also include `resolvedPath`, `context`, and `reason`.
-Successful results include their formatted `context`.
-
-With `mode: "files"`, commands are not executed. Command references are returned
-as disabled and remain literal in the source text.
-
-If pi-resolve is not installed, `request.response` remains unset. Consumers must
-handle an unset response and reject failed file outcomes or incompatible
-responses, including a success without a string `context`, rather than silently
-dropping requested content.
-
-### Policy and ownership
-
-Shared calls use `sources.extension`, which inherits defaults, not
-`sources.userInput`. Restrictions for shared calls belong under `extension`.
-
-Caller restrictions can only reduce capabilities: `mode: "files"` never executes
-commands and cannot enable files disabled by settings. Shared calls use the same
-size limits, with a separate total budget for each request.
-
-Shared calls return structured results without automatically attaching them or
-rendering a summary. The calling extension or tool owns those actions;
-`extension.display` does not cause automatic rendering.
-
-### Matcher-only consumers
-
-`extractFileRefs` from `pi-resolve/src/matcher.ts` is the canonical pure matcher.
-It does not load the extension, read files, or execute commands. Consumers can
-use it to detect whether the shared resolver is needed without maintaining a
-second regular expression.
-
-Importing the matcher does not register a resolver listener. Load the extension
-through Pi's package settings to use the shared event. Consumers must still
-handle an unset `request.response` when the extension is absent or incompatible.
+Check that `request.response` exists before awaiting it: no response means the
+resolver is unavailable. Check each result before using it, so a missing file or
+failed command is reported rather than silently left out of the model's context.
 
 ## Development
 
@@ -330,19 +221,8 @@ npm test
 pi -e .
 ```
 
-To install the checkout for regular use:
-
-```bash
-pi install /path/to/pi-resolve
-```
-
-Pi loads TypeScript directly from `src/` through the package manifest. There is
-no build step or `dist/` directory. Tests and reusable fixtures live separately
-in `tests/` and are excluded from the published package.
-
-Tests use Pi's built-in faux provider and isolated scratch directories, with no
-external model calls or real credentials. The suite includes a packed CLI smoke
-test and real command-timeout checks. Run a focused suite with
-`node --test tests/resolver.test.ts`.
+Pi loads TypeScript directly; there is no build step. Tests use Pi's faux provider
+and isolated directories, with no external model calls or real credentials. The
+suite includes a packed CLI smoke test and command-timeout checks.
 
 [Changelog](CHANGELOG.md) · [MIT license](LICENSE)

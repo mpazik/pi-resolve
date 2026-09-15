@@ -108,6 +108,38 @@ describe("Shared resolver", () => {
     });
   });
 
+  describe("Command deadlines", () => {
+    test("shared calls use the configured timeout and omit unfinished output", { timeout: 5_000 }, async () => {
+      await workspace.writeFiles({ ".pi/pi-resolve.json": JSON.stringify({
+        limits: { commandTimeoutMs: 100 }, sources: { extension: { commands: true } },
+      }) });
+      const harness = createResolverHarness();
+      await harness.start(root);
+      assert.deepEqual(await harness.resolve('!`printf partial; sleep 1; printf late`', root), {
+        context: [],
+        references: [{
+          kind: "command", reference: "printf partial; sleep 1; printf late", index: 0,
+          status: "error", reason: "command timed out or was killed",
+        }],
+      });
+    });
+
+    test("raising the timeout lets a command run beyond the former fixed deadline", { timeout: 20_000 }, async () => {
+      await workspace.writeFiles({ ".pi/pi-resolve.json": JSON.stringify({
+        limits: { commandTimeoutMs: 15_000 }, sources: { extension: { commands: true } },
+      }) });
+      const harness = createResolverHarness();
+      await harness.start(root);
+      assert.deepEqual(await harness.resolve('!`sleep 10.1; printf done`', root), {
+        context: ['<bash command="sleep 10.1; printf done">\ndone\n</bash>'],
+        references: [{
+          kind: "command", reference: "sleep 10.1; printf done", index: 0, status: "success",
+          context: '<bash command="sleep 10.1; printf done">\ndone\n</bash>',
+        }],
+      });
+    });
+  });
+
   describe("Directory listings", () => {
     test("lists sorted immediate entries without reading files or recursing", async () => {
       const directory = join(root, "library");

@@ -11,6 +11,7 @@ export interface Limits {
   maxFileBytes: number;
   maxCommandBytes: number;
   maxTotalBytes: number;
+  commandTimeoutMs: number;
 }
 
 export interface Settings {
@@ -33,7 +34,7 @@ export interface SettingsIssue {
 const SOURCES: Source[] = ["userInput", "template", "systemPrompt", "skill", "extension"];
 
 export const DEFAULT_SETTINGS: Settings = {
-  limits: { maxFileBytes: 100_000, maxCommandBytes: 100_000, maxTotalBytes: 1_000_000 },
+  limits: { maxFileBytes: 100_000, maxCommandBytes: 100_000, maxTotalBytes: 1_000_000, commandTimeoutMs: 10_000 },
   defaults: { files: true, commands: true, display: "always" },
   sources: {
     template: { commands: false },
@@ -87,11 +88,13 @@ export function validateSettings(value: unknown): {
       }
       settings.limits = {};
       for (const [name, limit] of Object.entries(field)) {
-        if (name !== "maxFileBytes" && name !== "maxCommandBytes" && name !== "maxTotalBytes") {
+        if (name !== "maxFileBytes" && name !== "maxCommandBytes" && name !== "maxTotalBytes" && name !== "commandTimeoutMs") {
           issues.push({ path: "limits", code: "unknown-key" });
-        } else if (typeof limit === "number" && Number.isSafeInteger(limit) && limit > 0) {
-          settings.limits[name] = limit;
-        } else issues.push({ path: `limits.${name}`, code: "invalid-value" });
+        } else if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit <= 0
+          // Node converts an overflowing timer duration to a one-millisecond delay.
+          || (name === "commandTimeoutMs" && limit > 2_147_483_647)) {
+          issues.push({ path: `limits.${name}`, code: "invalid-value" });
+        } else settings.limits[name] = limit;
       }
     } else if (key === "defaults") {
       settings.defaults = validateConfig(field, "defaults");

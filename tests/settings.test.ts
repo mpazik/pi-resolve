@@ -59,9 +59,79 @@ describe("Byte limits", () => {
     assert.deepEqual(global.issues, []);
     assert.deepEqual(project.issues, []);
     assert.deepEqual(mergeSettings(global.settings, project.settings).limits, {
-      maxFileBytes: 7, maxCommandBytes: 5, maxTotalBytes: Number.MAX_SAFE_INTEGER,
+      maxFileBytes: 7, maxCommandBytes: 5, maxTotalBytes: Number.MAX_SAFE_INTEGER, commandTimeoutMs: 10_000,
     });
-    assert.deepEqual(mergeSettings({}, {}).limits, { maxFileBytes: 100_000, maxCommandBytes: 100_000, maxTotalBytes: 1_000_000 });
+    assert.deepEqual(mergeSettings({}, {}).limits, {
+      maxFileBytes: 100_000, maxCommandBytes: 100_000, maxTotalBytes: 1_000_000, commandTimeoutMs: 10_000,
+    });
+  });
+});
+
+describe("Command timeout", () => {
+  test("project timeout overrides global without replacing inherited byte limits", () => {
+    const global = validateSettings({ limits: { commandTimeoutMs: 30_000, maxFileBytes: 50 } });
+    const project = validateSettings({ limits: { commandTimeoutMs: 60_000 } });
+    assert.deepEqual({ globalIssues: global.issues, projectIssues: project.issues,
+      limits: mergeSettings(global.settings, project.settings).limits }, {
+      globalIssues: [], projectIssues: [],
+      limits: { maxFileBytes: 50, maxCommandBytes: 100_000, maxTotalBytes: 1_000_000, commandTimeoutMs: 60_000 },
+    });
+  });
+
+  test("omitting a project timeout preserves the global deadline", () => {
+    const global = validateSettings({ limits: { commandTimeoutMs: 30_000 } }).settings;
+    const project = validateSettings({ limits: { maxFileBytes: 50 } }).settings;
+    assert.deepEqual(mergeSettings(global, project).limits, {
+      maxFileBytes: 50, maxCommandBytes: 100_000, maxTotalBytes: 1_000_000, commandTimeoutMs: 30_000,
+    });
+  });
+
+  test("one millisecond is a valid deadline", () => {
+    assert.deepEqual(validateSettings({ limits: { commandTimeoutMs: 1 } }), {
+      settings: { limits: { commandTimeoutMs: 1 } }, issues: [],
+    });
+  });
+
+  test("Node's maximum timer duration is accepted without clamping", () => {
+    assert.deepEqual(validateSettings({ limits: { commandTimeoutMs: 2_147_483_647 } }), {
+      settings: { limits: { commandTimeoutMs: 2_147_483_647 } }, issues: [],
+    });
+  });
+
+  test("timer overflow is rejected instead of becoming a one-millisecond deadline", () => {
+    assert.deepEqual(validateSettings({ limits: { commandTimeoutMs: 2_147_483_648 } }), {
+      settings: { limits: {} }, issues: [{ path: "limits.commandTimeoutMs", code: "invalid-value" }],
+    });
+  });
+
+  test("zero cannot disable the command deadline", () => {
+    assert.deepEqual(validateSettings({ limits: { commandTimeoutMs: 0 } }), {
+      settings: { limits: {} }, issues: [{ path: "limits.commandTimeoutMs", code: "invalid-value" }],
+    });
+  });
+
+  test("negative durations are rejected", () => {
+    assert.deepEqual(validateSettings({ limits: { commandTimeoutMs: -1 } }), {
+      settings: { limits: {} }, issues: [{ path: "limits.commandTimeoutMs", code: "invalid-value" }],
+    });
+  });
+
+  test("fractional milliseconds are rejected", () => {
+    assert.deepEqual(validateSettings({ limits: { commandTimeoutMs: 1.5 } }), {
+      settings: { limits: {} }, issues: [{ path: "limits.commandTimeoutMs", code: "invalid-value" }],
+    });
+  });
+
+  test("invalid project values preserve the global timeout without exposing the value", () => {
+    const global = validateSettings({ limits: { commandTimeoutMs: 30_000 } }).settings;
+    const project = validateSettings({ limits: { commandTimeoutMs: "PRIVATE", maxFileBytes: 50 } });
+    assert.deepEqual(project, {
+      settings: { limits: { maxFileBytes: 50 } },
+      issues: [{ path: "limits.commandTimeoutMs", code: "invalid-value" }],
+    });
+    assert.deepEqual(mergeSettings(global, project.settings).limits, {
+      maxFileBytes: 50, maxCommandBytes: 100_000, maxTotalBytes: 1_000_000, commandTimeoutMs: 30_000,
+    });
   });
 });
 

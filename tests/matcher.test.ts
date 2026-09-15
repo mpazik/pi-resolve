@@ -67,8 +67,21 @@ describe("@file", () => {
     assertNoCapture("import x from '@scope/pkg'");
   });
 
-  test("@file: backslash before @ does NOT suppress (documents non-escape)", () =>
-    assertFileCapture("literal \\@file.md", "file.md"));
+  test("@file: backslash before @ suppresses resolution", () =>
+    assertNoCapture("literal \\@file.md"));
+
+  test("@file: odd backslash runs suppress home and relative paths", () =>
+    assertCapture(String.raw`\@~/notes.md \\\@./hidden.md @visible.md`, {
+      files: ["visible.md"],
+    }));
+
+  test("@file: even backslash runs allow references and path escapes", () =>
+    assertCapture(String.raw`\\@./My\ Notes.md \\\\@~/notes.md`, {
+      files: ["./My Notes.md", "~/notes.md"],
+    }));
+
+  test("@file: even backslash runs do not enable bare names", () =>
+    assertNoCapture(String.raw`\\@README \\\\@todo`));
 
   test("@file: bare word (no slash, no dot) is dropped", () =>
     assertNoCapture("an @todo item"));
@@ -107,10 +120,52 @@ describe("!`command`", () => {
   test("!`cmd`: inside tilde shell fence is skipped", () =>
     assertNoCapture("~~~sh\n!`date`\n~~~"));
 
-  test("!`cmd`: backslash before ! does NOT suppress (documents non-escape)", () =>
-    assertCommandCapture("literal \\!`date`", "date"));
+  test("!`cmd`: backslash before ! suppresses resolution", () =>
+    assertNoCapture("literal \\!`date`"));
 
-  test("!`cmd`: backslash before backtick breaks the pattern (accidental, not a real escape)", () =>
+  test("!`cmd`: odd backslash runs suppress only the escaped reference", () =>
+    assertCommandCapture("\\\\\\!`hidden` !`visible`", "visible"));
+
+  test("!`cmd`: even backslash runs allow references", () =>
+    assertCapture("\\\\!`first` \\\\\\\\!`second`", {
+      commands: ["first", "second"],
+    }));
+
+  test("!`cmd`: escaped backticks and shell escapes are preserved verbatim", () =>
+    assertCommandCapture(
+      "!`echo \\`date\\` \\$HOME a\\ b`",
+      "echo \\`date\\` \\$HOME a\\ b",
+    ));
+
+  test("!`cmd`: three backslashes escape a backtick without truncation", () =>
+    assertCommandCapture("!`echo \\\\\\`tail`", "echo \\\\\\`tail"));
+
+  test("!`cmd`: two backslashes allow the backtick to close", () =>
+    assertCapture("!`echo \\\\` @after.md !`next`", {
+      files: ["after.md"], commands: ["echo \\\\", "next"],
+    }));
+
+  test("!`cmd`: four backslashes also allow the backtick to close", () =>
+    assertCommandCapture("!`echo \\\\\\\\`", "echo \\\\\\\\"));
+
+  test("!`cmd`: escaped final backtick cannot produce a partial command", () =>
+    assertNoCapture("!`echo \\`"));
+
+  test("!`cmd`: unmatched escaped backtick with trailing text stays unresolved", () =>
+    assertCapture("@before.md !`echo \\` tail @after.md", {
+      files: ["before.md", "after.md"],
+    }));
+
+  test("!`cmd`: missing closing backtick stays unresolved", () =>
+    assertCapture("!`echo unfinished @after.md", { files: ["after.md"] }));
+
+  test("!`cmd`: a lone escaped backtick is valid command content", () =>
+    assertCommandCapture("!`\\``", "\\`"));
+
+  test("!`cmd`: escaped backticks in multiline commands stay verbatim", () =>
+    assertCommandCapture("!`echo \\`first\r\nsecond\\`\necho done`", "echo \\`first\r\nsecond\\`\necho done"));
+
+  test("!`cmd`: backslash between ! and the opening backtick is not command syntax", () =>
     assertNoCapture("literal !\\`date\\`"));
 
   test("!`cmd`: cannot close inside a fenced block", () =>
@@ -137,6 +192,16 @@ describe("mixed", () => {
 });
 
 describe("fenced code", () => {
+  test("fences: escapes do not enable references inside backtick fences", () =>
+    assertCapture("```sh\n\\\\@hidden.md \\\\!`echo \\`hidden\\``\n```\n@visible.md !`visible`", {
+      files: ["visible.md"], commands: ["visible"],
+    }));
+
+  test("fences: escaped command delimiters cannot cross tilde fences", () =>
+    assertCapture("!`echo \\`\n~~~\nhidden`\n~~~\n@visible.md !`visible`", {
+      files: ["visible.md"], commands: ["visible"],
+    }));
+
   test("fences: three-space indentation is allowed", () =>
     assertCapture("   ~~~sh\n@hidden.md !`hidden`\n   ~~~\n@visible.md !`visible`", {
       files: ["visible.md"], commands: ["visible"],
@@ -200,6 +265,31 @@ describe("fenced code", () => {
 });
 
 describe("inline code", () => {
+  test("spans: escaped command backticks do not hide nearby references", () =>
+    assertCapture("!`echo \\`date\\`` @visible.md !`next` `@hidden.md`", {
+      files: ["visible.md"], commands: ["echo \\`date\\`", "next"],
+    }));
+
+  test("spans: command delimiter parity does not change code-span pairing", () =>
+    assertCapture("`` \\\\@hidden.md \\\\!`echo \\`hidden\\`` `` @visible.md !`next`", {
+      files: ["visible.md"], commands: ["next"],
+    }));
+
+  test("spans: escaped command markers leave their contents as inline code", () =>
+    assertCapture("\\!`@hidden.md` @visible.md !`next`", {
+      files: ["visible.md"], commands: ["next"],
+    }));
+
+  test("spans: escaped markers use code-span closers without consuming the next command", () =>
+    assertCapture("\\!`literal \\` @visible.md !`next`", {
+      files: ["visible.md"], commands: ["next"],
+    }));
+
+  test("spans: suppressed command candidates cannot consume a following prose command", () =>
+    assertCapture("`` !`literal \\` `` @visible.md !`next`", {
+      files: ["visible.md"], commands: ["next"],
+    }));
+
   test("spans: double-backtick span contains shell delimiters", () =>
     assertCapture("`` @hidden.md !`hidden` `` @visible.md !`visible`", {
       files: ["visible.md"], commands: ["visible"],
@@ -239,6 +329,17 @@ describe("inline code", () => {
 });
 
 describe("reference offsets", () => {
+  test("offsets: escape prefixes stay outside matches and command escapes stay inside", () => {
+    const text = "😀 \\@no.md \\\\@a\\ b.md \\!`no` \\\\!`echo \\`x\\`` @z.md";
+    assert.deepEqual(extractFileReferenceMatches(text), [
+      { index: 13, fullMatch: "@a\\ b.md", path: "a b.md" },
+      { index: 45, fullMatch: "@z.md", path: "z.md" },
+    ]);
+    assert.deepEqual(extractCommandRefs(text), [
+      { index: 31, fullMatch: "!`echo \\`x\\``", command: "echo \\`x\\`" },
+    ]);
+  });
+
   test("offsets: UTF-16 indices and escaped source text are preserved", () => {
     const text = "😀 @a\\ b.md !`echo ok` @a\\ b.md";
     assert.deepEqual(extractFileReferenceMatches(text), [

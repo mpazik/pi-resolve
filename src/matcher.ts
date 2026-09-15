@@ -6,8 +6,17 @@
 export const FILE_REGEX =
   /(?<![\w`/"'])@(~\/(?:[^\s`,.\\"';()[\]{}]|\\.)*(?:\.(?:[^\s`,.\\"';()[\]{}]|\\.)+)*|\.?(?:[^\s`,.\\"';()[\]{}]|\\.)*(?:\.(?:[^\s`,.\\"';()[\]{}]|\\.)+)*)/g;
 
-/** Matches `` !`command` `` but not when `!` is preceded by a backtick (e.g., inline code `!`) */
-export const SHELL_REGEX = /(?<!`)!`([^`]+)`/g;
+/** Matches non-empty shell candidates, preserving escapes verbatim.
+ *  Backslashes pair with the next character, so only an even-backslash backtick
+ *  closes the command. Marker escape parity is checked before resolution. */
+export const SHELL_REGEX = /(?<!`)!`((?:[^`\\]|\\[\s\S])+)`/g;
+
+/** An odd run of backslashes immediately before a reference marker escapes it. */
+function isBackslashEscaped(text: string, offset: number): boolean {
+  let start = offset;
+  while (start > 0 && text[start - 1] === "\\") start--;
+  return (offset - start) % 2 === 1;
+}
 
 /** Matches a `<skill>` envelope as emitted by the skill-tool extension.
  *  Captures: 1=name, 2=location, 3=baseDir, 4=body, 5=optional trailing args. */
@@ -75,14 +84,15 @@ function appendInlineCodeRanges(
     else runs.set(length, { positions: [runStart], cursor: 0 });
   }
 
+  // Use the extraction grammar at the current offset, never a separate closer rule.
+  const shell = new RegExp(SHELL_REGEX.source, "y");
   offset = start;
   while (offset < end) {
     // Shell syntax takes precedence only outside an already matched code span.
-    // Preserve the existing non-empty, single-backtick command grammar.
-    if (text[offset] === "!" && text[offset - 1] !== "`" && text[offset + 1] === "`") {
-      const close = text.indexOf("`", offset + 2);
-      if (close > offset + 2 && close < end) {
-        offset = close + 1;
+    if (text[offset] === "!" && !isBackslashEscaped(text, offset)) {
+      shell.lastIndex = offset;
+      if (shell.exec(text) && shell.lastIndex <= end) {
+        offset = shell.lastIndex;
         continue;
       }
     }
@@ -140,13 +150,13 @@ export interface FileRef {
 }
 
 /** Extract `@file` references from `text`, in document order.
- *  Skips refs inside code spans/fences, unescapes path characters, and
+ *  Skips escaped markers and refs inside code spans/fences, unescapes path characters, and
  *  drops bare words (no `/` and no `.`). */
 export function extractFileReferenceMatches(text: string): FileRef[] {
   const ranges = buildCodeRanges(text);
   const out: FileRef[] = [];
   for (const match of text.matchAll(FILE_REGEX)) {
-    if (isInsideCode(match.index, ranges)) continue;
+    if (isBackslashEscaped(text, match.index) || isInsideCode(match.index, ranges)) continue;
     const path = unescapePath(match[1]!);
     if (isBareWord(path)) continue;
     out.push({ index: match.index, fullMatch: match[0], path });
@@ -159,16 +169,24 @@ export function extractFileRefs(text: string): string[] {
 }
 
 /** Extract `` !`command` `` references from `text`, in document order.
- *  Skips refs inside code spans/fences. */
+ *  Skips escaped markers and refs inside code spans/fences. */
 export function extractCommandRefs(text: string): CommandRef[] {
   const ranges = buildCodeRanges(text);
   const out: CommandRef[] = [];
-  for (const match of text.matchAll(SHELL_REGEX)) {
+  const shell = new RegExp(SHELL_REGEX.source, "y");
+  for (let index = text.indexOf("!"); index !== -1; index = text.indexOf("!", index + 1)) {
+    // Skip suppressed openers before matching so their apparent commands cannot
+    // consume later references. Code spans do not use shell escape rules.
+    if (isBackslashEscaped(text, index) || isInsideCode(index, ranges)) continue;
+    shell.lastIndex = index;
+    const match = shell.exec(text);
+    if (!match) continue;
     // Reject the whole command if any part crosses a code boundary, not just
     // commands whose opening marker is inside code.
-    const end = match.index + match[0].length;
-    if (ranges.some(([start, stop]) => match.index < stop && end > start)) continue;
-    out.push({ index: match.index, fullMatch: match[0], command: match[1]! });
+    const end = shell.lastIndex;
+    if (ranges.some(([start, stop]) => index < stop && end > start)) continue;
+    out.push({ index, fullMatch: match[0], command: match[1]! });
+    index = end - 1;
   }
   return out;
 }
