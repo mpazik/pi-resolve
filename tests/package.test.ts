@@ -29,7 +29,7 @@ test("packed installation is discovered by the actual print CLI and reaches a co
   const [{ filename, files }] = JSON.parse(packed.stdout);
   assert.deepEqual(files.map((file: { path: string }) => file.path).sort(), [
     "CHANGELOG.md", "LICENSE", "README.md", "package.json",
-    "src/matcher.ts", "src/pi-resolve.ts", "src/settings.ts",
+    "src/matcher.ts", "src/pi-resolve.ts", "src/resolver.ts", "src/settings.ts",
   ]);
   // Install the tarball without registry access or peer installation. Pi supplies
   // extension dependencies through its loader, as it does for published packages.

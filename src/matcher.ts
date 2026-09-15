@@ -1,14 +1,4 @@
-/**
- * Pure matching patterns and helpers used by pi-resolve to detect references
- * (`@file`, `` !`cmd` ``) and skill envelopes in text.
- *
- * Dependency-free so they can be unit-tested without loading the pi/tui
- * extension surface.
- */
-
-// ---------- regex patterns ----------
-
-/** Matches `@relative/path` but not inside backticks, preceded by word chars, `/` (npm scopes), or quotes (imports).
+/** Matches `@relative/path` unless preceded by word chars, backticks, `/` (npm scopes), or quotes (imports).
  *  Supports backslash-escaped characters (e.g., `\ ` for spaces in paths).
  *  Also matches `@~/...` for home directory references.
  *  Excludes quotes, semicolons, and brackets from path characters to avoid matching
@@ -24,10 +14,7 @@ export const SHELL_REGEX = /(?<!`)!`([^`]+)`/g;
 export const SKILL_BLOCK_REGEX =
   /^<skill name="([^"]+)" location="([^"]+)">\nReferences are relative to ([^\n]+)\.\n\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/;
 
-// ---------- code ranges ----------
-
-/** Build a set of character ranges that fall inside fenced code blocks or inline code spans.
- *  Used to check whether a regex match at a given offset should be skipped. */
+/** Fenced blocks and inline spans, excluding shell reference delimiters. */
 export function buildCodeRanges(
   text: string,
 ): Array<[start: number, end: number]> {
@@ -119,7 +106,6 @@ function appendInlineCodeRanges(
   }
 }
 
-/** Check if a character offset falls inside any code range. */
 export function isInsideCode(
   offset: number,
   ranges: Array<[number, number]>,
@@ -130,10 +116,7 @@ export function isInsideCode(
   return false;
 }
 
-// ---------- path escaping ----------
-
-/** Collapse backslash escapes in an `@file` path: `\<char>` → `<char>`.
- *  Use to convert a regex capture group into the actual filesystem name. */
+/** Collapse backslash escapes in an `@file` path: `\<char>` → `<char>`. */
 export function unescapePath(name: string): string {
   return name.replace(/\\(.)/g, "$1");
 }
@@ -144,17 +127,12 @@ export function isBareWord(name: string): boolean {
   return !name.includes("/") && !name.includes(".");
 }
 
-// ---------- ref extraction ----------
-
-/** A `` !`command` `` reference found in text. Carries the offset and full
- *  matched substring so callers can splice the result back in place. */
 export interface CommandRef {
   index: number;
   fullMatch: string;
   command: string;
 }
 
-/** An `@file` reference found in text, including its source offset. */
 export interface FileRef {
   index: number;
   fullMatch: string;
@@ -185,12 +163,39 @@ export function extractFileRefs(text: string): string[] {
 export function extractCommandRefs(text: string): CommandRef[] {
   const ranges = buildCodeRanges(text);
   const out: CommandRef[] = [];
-  for (const m of text.matchAll(SHELL_REGEX)) {
+  for (const match of text.matchAll(SHELL_REGEX)) {
     // Reject the whole command if any part crosses a code boundary, not just
     // commands whose opening marker is inside code.
-    const end = m.index + m[0].length;
-    if (ranges.some(([start, stop]) => m.index < stop && end > start)) continue;
-    out.push({ index: m.index, fullMatch: m[0], command: m[1]! });
+    const end = match.index + match[0].length;
+    if (ranges.some(([start, stop]) => match.index < stop && end > start)) continue;
+    out.push({ index: match.index, fullMatch: match[0], command: match[1]! });
   }
   return out;
+}
+
+type ReferenceCandidate =
+  | (FileRef & { kind: "file" })
+  | (CommandRef & { kind: "command" });
+
+export function referenceCandidates(text: string, fileText = text): ReferenceCandidate[] {
+  return [
+    ...extractFileReferenceMatches(fileText).map((reference) => ({ kind: "file" as const, ...reference })),
+    ...extractCommandRefs(text).map((reference) => ({ kind: "command" as const, ...reference })),
+  ].sort((left, right) => left.index - right.index);
+}
+
+/** Expansion may duplicate arguments. Without a source map, identical expanded
+ * references conservatively retain direct-input policy, including disabled refs. */
+export function maskDirectReferences(text: string, input: string, kind?: "file" | "command"): string {
+  const key = (candidate: ReferenceCandidate) =>
+    candidate.kind === "file" ? `file:${candidate.path}` : `command:${candidate.command}`;
+  const captured = new Set(referenceCandidates(input)
+    .filter((candidate) => !kind || candidate.kind === kind).map(key));
+  const consumed = referenceCandidates(text).filter((candidate) => captured.has(key(candidate)));
+  for (const match of consumed.reverse()) {
+    // Preserve argument positions for subsequent skill $N substitution.
+    const mask = match.fullMatch.replace(/\S/g, "_");
+    text = text.slice(0, match.index) + mask + text.slice(match.index + match.fullMatch.length);
+  }
+  return text;
 }

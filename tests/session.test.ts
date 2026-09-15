@@ -428,6 +428,19 @@ describe("Source policy", () => {
 });
 
 describe("Display", () => {
+  test("summaries keep commands first, file links, and empty and multiline counts", async (t) => {
+    const h = await createHarness(t, { files: { "empty.md": "", "lines.md": "one\ntwo\n" } });
+    await h.prompt('@empty.md !`true` @lines.md !`printf "one\\ntwo\\n"`');
+    const summary = h.session.messages.find((message) => message.role === "custom" && message.customType === "context");
+    assert.ok(summary?.role === "custom");
+    assert.deepEqual(summary.details, { items: [
+      { kind: "bash", label: "true", lines: 0, result: "ok", message: undefined },
+      { kind: "bash", label: 'printf "one\\ntwo\\n"', lines: 2, result: "ok", message: undefined },
+      { kind: "file", label: "empty.md", path: join(h.cwd, "empty.md"), lines: 0, result: "ok", message: undefined },
+      { kind: "file", label: "lines.md", path: join(h.cwd, "lines.md"), lines: 3, result: "ok", message: undefined },
+    ] });
+  });
+
   for (const display of ["always", "errors", "never"] as const) {
     test(`${display} filters summary items, not provider context`, async (t) => {
       const h = await createHarness(t, {

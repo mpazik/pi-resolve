@@ -209,6 +209,30 @@ describe("Shared resolver", () => {
   });
 
   describe("Request budgets", () => {
+    test("an empty file fits when only its wrapper fits the budget", async () => {
+      await writeFile(join(root, "a.md"), "");
+      const result = await createResolverHarness({ maxTotalBytes: 27 }).resolve("@a.md", root);
+      assert.deepEqual(result, {
+        context: ['<file path="a.md">\n\n</file>'],
+        references: [{
+          kind: "file", reference: "a.md", index: 0, status: "success",
+          resolvedPath: join(root, "a.md"), context: '<file path="a.md">\n\n</file>',
+        }],
+      });
+    });
+
+    test("a silent command does not run when only its wrapper fits the budget", async () => {
+      const result = await createResolverHarness({ maxTotalBytes: 41 }).resolve("!`touch forbidden`", root);
+      assert.deepEqual(result, {
+        context: [],
+        references: [{
+          kind: "command", reference: "touch forbidden", index: 0,
+          status: "oversized", reason: "total byte budget exceeded",
+        }],
+      });
+      await assert.rejects(readFile(join(root, "forbidden")), { code: "ENOENT" });
+    });
+
     test("shared total includes UTF-8 wrappers, omits whole items and resets for each request", async () => {
       await mkdir(join(root, ".pi"));
       await writeFile(join(root, ".pi/pi-resolve.json"), JSON.stringify({ limits: { maxTotalBytes: 29 } }));
