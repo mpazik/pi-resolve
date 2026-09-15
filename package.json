@@ -26,9 +26,12 @@
       "./src/pi-resolve.ts"
     ]
   },
+  "engines": {
+    "node": ">=26 <27"
+  },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": "~0.85.1",
+    "@earendil-works/pi-tui": "~0.85.1"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.85.1",
