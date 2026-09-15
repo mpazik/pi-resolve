@@ -2,7 +2,7 @@
 
 Give [Pi](https://pi.dev) instant context from files and shell commands.
 
-![Pi resolving file and command references in a prompt](.github/media/pi-resolve.png)
+![Pi resolving file and command references in a prompt](https://raw.githubusercontent.com/mpazik/pi-resolve/main/.github/media/pi-resolve.png)
 
 Pi receives the files and command output before the agent responds, saving the time and
 token overhead of extra tool calls. Your prompt stays unchanged, with file and
@@ -43,10 +43,11 @@ pi install npm:pi-resolve
 
 Start a new Pi session after installing.
 
-## Usage
+Requires the latest stable Pi and **Node.js 22.19.0 or newer**, matching Pi's
+runtime requirement. Supports **macOS and Linux** with `sh` available.
+Native Windows is not tested; use Linux under WSL.
 
-Resolution is single-level: references inside imported files or command output
-remain text. A command that lists filenames does not attach those files.
+## Usage
 
 ### Files
 
@@ -118,16 +119,30 @@ an even run does not.
 
 These are configurable defaults. Files include directory listings.
 
-Prompts and templates resolve each turn. System context resolves on the first
-turn of the session, not continuously.
-
 Skill references resolve after argument substitution, with file paths relative
 to the skill directory. Commands still run
 in the project directory. References you type as arguments keep direct-prompt
 settings and paths.
 
-Other extensions must opt into the shared resolver below. Arbitrary tool inputs
-and outputs are not automatically resolved.
+Other extensions must opt into the shared resolver below. Prompts injected with
+`pi.sendUserMessage`, including their expanded templates and skills, are not
+automatically resolved. Arbitrary tool inputs and outputs are also left untouched.
+
+## Limitations
+
+- **Queued prompts:** steering and follow-up messages do not receive resolved
+  context. Commands typed in them can still execute without their output
+  reaching the model. Submit references after the agent finishes instead.
+- **Single-level imports:** references inside imported files or command output
+  stay literal. Listing filenames does not attach those files.
+- **System context is a snapshot:** system references resolve on the first turn
+  after session start or reload, not on every turn. Cached command output is
+  reused rather than refreshed.
+- **Repeated template references:** a reference identical to one typed in the
+  prompt keeps direct-prompt permissions, even if template settings would
+  otherwise allow it.
+- **Command ordering:** separate command expressions can run concurrently. Put
+  dependent operations in one expression rather than relying on their order.
 
 ## Settings
 
@@ -214,6 +229,12 @@ resolver is unavailable. Check each result before using it, so a missing file or
 failed command is reported rather than silently left out of the model's context.
 
 ## Development
+
+Use Node.js 26 for development (Node.js 24 also runs the checks). Native tests
+use `await using`, which Node.js 22 cannot parse directly. The installed extension
+runs through Pi's TypeScript loader, so this does not limit its runtime support.
+CI runs the full suite on Node.js 24 and 26 and the packed Pi CLI on Node.js 22,
+on both macOS and Linux.
 
 From a checkout:
 

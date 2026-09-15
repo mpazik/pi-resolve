@@ -137,6 +137,7 @@ export default function (pi: ExtensionAPI): void {
   // Input precedes template/skill expansion. Carry provenance and budget together.
   let pendingTurn: {
     input: string;
+    source: "userInput" | "extension";
     ctx: ResolveSourceCtx;
     direct: SourceResolution;
   } | undefined;
@@ -190,6 +191,12 @@ export default function (pi: ExtensionAPI): void {
     const ctx: ResolveSourceCtx = {
       settings, budget: { remaining: settings.limits.maxTotalBytes }, seenFiles: new Set(), cwd: sessionCwd,
     };
+    // sendUserMessage emits input too. Only explicit shared-resolver requests
+    // may resolve extension content, even when its templates/skills are expanded.
+    if (event.source === "extension") {
+      pendingTurn = { input, source: "extension", ctx, direct: { attachments: [], inlines: [] } };
+      return { action: "continue" };
+    }
     const directConfig = cfgFor(settings, "userInput");
     const commands = directConfig.commands ? extractCommandRefs(input) : [];
     const showLoader = extensionCtx.hasUI && directConfig.display === "always" && commands.length > 0;
@@ -209,7 +216,7 @@ export default function (pi: ExtensionAPI): void {
       loader?.stop();
       if (showLoader) extensionCtx.ui.setWidget("pi-resolve", undefined);
     }
-    pendingTurn = { input, ctx, direct };
+    pendingTurn = { input, source: "userInput", ctx, direct };
     return { action: "continue" };
   });
 
@@ -240,7 +247,8 @@ export default function (pi: ExtensionAPI): void {
     }
 
     const prompt = event.prompt;
-    const skill = parseSkillBlock(prompt);
+    const resolvePrompt = turn?.source === "userInput";
+    const skill = resolvePrompt ? parseSkillBlock(prompt) : null;
     if (skill) {
       const commandArgs = maskDirectReferences(skill.args, input ?? "", "command");
       const substituted = substituteSkillArgs(skill.body, commandArgs);
@@ -253,7 +261,7 @@ export default function (pi: ExtensionAPI): void {
       const args = extractFileReferenceMatches(fileArgs).map(({ fullMatch }) => fullMatch).join("\n");
       const resolvedArgs = await resolveSource(ctx, args, "skill");
       allAttachments.push(...resolvedArgs.attachments);
-    } else if (prompt !== input) {
+    } else if (resolvePrompt && prompt !== input) {
       // Direct references retain their policy, even when disabled. Only newly
       // introduced references belong to the template.
       const expanded = maskDirectReferences(prompt, input ?? "");

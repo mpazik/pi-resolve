@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  node22-smoke:
     strategy:
       fail-fast: false
       matrix:
@@ -16,10 +16,37 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22.19.0
+          package-manager-cache: false
+      - name: Capture Node.js 22 runtime
+        id: runtime
+        run: echo "node=$(node -p 'process.execPath')" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 26
+          cache: npm
+      - run: npm ci
+      - name: Test packed extension through Pi on Node.js 22
+        env:
+          PI_RESOLVE_TEST_NODE: ${{ steps.runtime.outputs.node }}
+        run: node --test tests/package.test.ts
+
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [24, 26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm run typecheck

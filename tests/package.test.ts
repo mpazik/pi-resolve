@@ -12,7 +12,7 @@ import { createWorkspace } from "./fixtures/workspace.mock.ts";
 const exec = promisify(execFile);
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
 
-test("packed extension installs and resolves a file through the print CLI", { timeout: 60_000 }, async () => {
+test("packed extension installs and resolves file and shell context through the print CLI", { timeout: 60_000 }, async () => {
   await using workspace = await createWorkspace({ prefix: "pi-resolve-cli-" });
   const { root } = workspace;
   const cwd = join(root, "project");
@@ -35,17 +35,21 @@ test("packed extension installs and resolves a file through the print CLI", { ti
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [installed], retry: { enabled: false }, compaction: { enabled: false } }));
   await workspace.writeFiles({ "project/note.md": "PACKED_CONTEXT" });
   const capture = join(root, "request.jsonl");
-  const cli = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/index\.js$/, "cli.js");
-  const running = exec(process.execPath, [cli,
+  const piRoot = dirname(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))));
+  const piPackage = JSON.parse(await readFile(join(piRoot, "package.json"), "utf8"));
+  const cli = join(piRoot, piPackage.bin.pi);
+  // The extension runs through Pi's loader, which can support an older Node
+  // than the native-TypeScript test runner. CI supplies that runtime explicitly.
+  const running = exec(process.env.PI_RESOLVE_TEST_NODE ?? process.execPath, [cli,
     "--print", "--no-session", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
     "--extension", join(repo, "tests/fixtures/provider.mock.ts"),
-    "--provider", "resolve-test", "--model", "faux-1", "Resolve @note.md",
+    "--provider", "resolve-test", "--model", "faux-1", "Resolve @note.md !`printf PACKED_SHELL`",
   ], { cwd, env: { ...env, PI_RESOLVE_TEST_CAPTURE: capture }, timeout: 20_000 });
   running.child.stdin?.end();
   const result = await running;
   const requests: Context[] = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual({ stdout: result.stdout.trim(), requests: requests.map(contextTexts) }, {
     stdout: "OK",
-    requests: [["Resolve @note.md", '<file path="note.md">\nPACKED_CONTEXT\n</file>']],
+    requests: [["Resolve @note.md !`printf PACKED_SHELL`", '<bash command="printf PACKED_SHELL">\nPACKED_SHELL\n</bash>', '<file path="note.md">\nPACKED_CONTEXT\n</file>']],
   });
 });

@@ -85,6 +85,19 @@ export async function assertSessionTurns(input: SessionInput, expected: SessionE
   });
 }
 
+export async function assertInjectedPrompt(input: NonNullable<Parameters<typeof createHarness>[1]> & {
+  prompt: string; expandPromptTemplates?: boolean;
+}, expected: { turn: TurnExpected; files: Record<string, string | null> }, { t }: Options) {
+  const h = await createHarness(t, input);
+  h.queue();
+  // This is the same SDK boundary used by pi.sendUserMessage.
+  await h.session.sendUserMessage(input.prompt, { expandPromptTemplates: input.expandPromptTemplates });
+  assert.deepEqual({
+    turn: readTurn(h, h.requests.at(-1)!, expected.turn),
+    files: await readFileEffects(h.cwd, Object.keys(expected.files)),
+  }, { turn: expectedTurn(expected.turn), files: expected.files });
+}
+
 export async function assertSourceResolution(input: {
   source: "userInput" | "systemPrompt" | "skill" | "template";
   body: string; files: Record<string, string>; projectSettings: string;
