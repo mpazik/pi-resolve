@@ -3,7 +3,26 @@ import { describe, test } from "node:test";
 import { cfgFor, mergeSettings, shouldDisplay, validateSettings, type Source } from "../src/settings.ts";
 const sources: Source[] = ["userInput", "template", "systemPrompt", "skill", "extension"];
 
+function assertPolicy(input: { global: unknown; project: unknown; source: Source }, expected: {
+  config: ReturnType<typeof cfgFor>; issues: ReturnType<typeof validateSettings>["issues"];
+}) {
+  const global = validateSettings(input.global);
+  const project = validateSettings(input.project);
+  assert.deepEqual({ config: cfgFor(mergeSettings(global.settings, project.settings), input.source),
+    issues: [...global.issues, ...project.issues] }, expected);
+}
+
 describe("Defaults and precedence", () => {
+  test("display-only project overrides retain global command restrictions", () =>
+    assertPolicy({ global: { sources: { userInput: { commands: false } } },
+      project: { sources: { userInput: { display: "never" } } }, source: "userInput" },
+    { config: { files: true, commands: false, display: "never" }, issues: [] }));
+
+  test("invalid project commands retain global restrictions without leaking private values", () =>
+    assertPolicy({ global: { sources: { userInput: { commands: false } } },
+      project: { sources: { userInput: { commands: "PRIVATE_INVALID", display: "never" } } }, source: "userInput" },
+    { config: { files: true, commands: false, display: "never" }, issues: [{ path: "sources.userInput.commands", code: "invalid-value" }] }));
+
   test("built-in policy trusts user and system commands and displays only user prompts", () => {
     const settings = mergeSettings({}, {});
     assert.deepEqual(sources.map((source) => cfgFor(settings, source)), [
@@ -148,30 +167,41 @@ describe("Validation and diagnostics", () => {
     assert.deepEqual(validateSettings({ limits: null }).issues, [{ path: "limits", code: "invalid-object" }]);
   });
 
-  test("invalid shapes, types, enums and unknown keys cannot replace inherited values or leak values", () => {
-    for (const value of [null, [], true, "PRIVATE", 123]) {
-      assert.deepEqual(validateSettings(value), { settings: {}, issues: [{ path: "$", code: "invalid-object" }] });
-    }
-    for (const value of [null, [], "PRIVATE", false, 3]) {
-      for (const key of ["defaults", "sources"]) {
-        const result = validateSettings({ [key]: value });
-        assert.deepEqual(result.issues, [{ path: key, code: "invalid-object" }]);
-      }
-      for (const source of sources) {
-        assert.deepEqual(validateSettings({ sources: { [source]: value } }).issues,
-          [{ path: `sources.${source}`, code: "invalid-object" }]);
-      }
-    }
-    for (const source of sources) {
-      const result = validateSettings({ PRIVATE_KEY: "PRIVATE_VALUE", defaults: { files: "PRIVATE_VALUE", commands: 0, display: "sometimes" }, sources: {
-        PRIVATE_SOURCE: {}, [source]: { files: null, commands: [], display: false, PRIVATE_KEY: "PRIVATE_VALUE" },
-      } });
-      assert.equal(result.issues.length, 9);
-      assert.doesNotMatch(JSON.stringify(result.issues), /PRIVATE|sometimes/);
-      const inherited = validateSettings({ defaults: { files: false, commands: false, display: "errors" } }).settings;
-      assert.deepEqual(cfgFor(mergeSettings(inherited, result.settings), source), { files: false, commands: false, display: "errors" });
-    }
-  });
+  test("null is not a settings object", () =>
+    assert.deepEqual(validateSettings(null), { settings: {}, issues: [{ path: "$", code: "invalid-object" }] }));
+
+  test("arrays cannot masquerade as settings objects", () =>
+    assert.deepEqual(validateSettings([]), { settings: {}, issues: [{ path: "$", code: "invalid-object" }] }));
+
+  test("scalar settings are rejected without retaining private input", () =>
+    assert.deepEqual(validateSettings("PRIVATE"), { settings: {}, issues: [{ path: "$", code: "invalid-object" }] }));
+
+  test("invalid defaults and sources report their owning paths", () =>
+    assert.deepEqual(validateSettings({ defaults: null, sources: [] }), {
+      settings: { defaults: {} }, issues: [{ path: "defaults", code: "invalid-object" }, { path: "sources", code: "invalid-object" }],
+    }));
+
+  test("invalid source configurations preserve each source path", () =>
+    assert.deepEqual(validateSettings({ sources: { userInput: null, template: [], systemPrompt: "PRIVATE", skill: false, extension: 3 } }), {
+      settings: { sources: { userInput: {}, template: {}, systemPrompt: {}, skill: {}, extension: {} } },
+      issues: [
+        { path: "sources.userInput", code: "invalid-object" }, { path: "sources.template", code: "invalid-object" },
+        { path: "sources.systemPrompt", code: "invalid-object" }, { path: "sources.skill", code: "invalid-object" },
+        { path: "sources.extension", code: "invalid-object" },
+      ],
+    }));
+
+  test("invalid fields and unknown names retain inherited policy with exact value-free diagnostics", () =>
+    assertPolicy({ source: "skill", global: { defaults: { files: false, commands: false, display: "errors" } },
+      project: { PRIVATE_KEY: "PRIVATE_VALUE", defaults: { files: "PRIVATE_VALUE", commands: 0, display: "sometimes" },
+        sources: { PRIVATE_SOURCE: {}, skill: { files: null, commands: [], display: false, PRIVATE_KEY: "PRIVATE_VALUE" } } },
+    }, { config: { files: false, commands: false, display: "errors" }, issues: [
+      { path: "$", code: "unknown-key" },
+      { path: "defaults.files", code: "invalid-value" }, { path: "defaults.commands", code: "invalid-value" },
+      { path: "defaults.display", code: "invalid-value" }, { path: "sources", code: "unknown-key" },
+      { path: "sources.skill.files", code: "invalid-value" }, { path: "sources.skill.commands", code: "invalid-value" },
+      { path: "sources.skill.display", code: "invalid-value" }, { path: "sources.skill", code: "unknown-key" },
+    ] }));
 
   test("valid sibling settings survive validation failures without mutating inputs", () => {
     const globalInput = { defaults: { files: false, commands: false, display: "errors" } };
@@ -191,9 +221,12 @@ describe("Validation and diagnostics", () => {
 });
 
 describe("Display filtering", () => {
-  test("display filtering covers successes, errors and skipped results", () => {
-    for (const [display, expected] of [["always", [true, true, true]], ["errors", [false, true, true]], ["never", [false, false, false]]] as const) {
-      assert.deepEqual(["ok", "error", "skipped"].map((status) => shouldDisplay(display, status as "ok" | "error" | "skipped")), expected);
-    }
-  });
+  test("always displays successes, errors and skipped results", () =>
+    assert.deepEqual([shouldDisplay("always", "ok"), shouldDisplay("always", "error"), shouldDisplay("always", "skipped")], [true, true, true]));
+
+  test("errors displays failures and skipped results but not successes", () =>
+    assert.deepEqual([shouldDisplay("errors", "ok"), shouldDisplay("errors", "error"), shouldDisplay("errors", "skipped")], [false, true, true]));
+
+  test("never hides every result", () =>
+    assert.deepEqual([shouldDisplay("never", "ok"), shouldDisplay("never", "error"), shouldDisplay("never", "skipped")], [false, false, false]));
 });

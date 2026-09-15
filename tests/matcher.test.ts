@@ -10,6 +10,7 @@ import {
   extractFileRefs,
   extractFileReferenceMatches,
   extractCommandRefs,
+  maskDirectReferences,
 } from "../src/matcher.ts";
 
 
@@ -401,6 +402,32 @@ describe("<skill> envelope", () => {
   test("SKILL_BLOCK_REGEX: non-skill text does not match", () => {
     assert.equal("just a regular message".match(SKILL_BLOCK_REGEX), null);
   });
+});
+
+describe("Direct reference masking", () => {
+  test("all duplicated expanded arguments retain direct provenance", () =>
+    assert.equal(maskDirectReferences('@a.md !`run` @a.md !`run` @new.md', '@a.md !`run`'),
+      '_____ ______ _____ ______ @new.md'));
+
+  test("file-only masking leaves commands available for separate policy", () =>
+    assert.equal(maskDirectReferences('@a.md !`run` @new.md', '@a.md !`run`', "file"),
+      '_____ !`run` @new.md'));
+
+  test("command-only masking preserves file argument positions and whitespace", () =>
+    assert.equal(maskDirectReferences('@a.md !`echo a\nb` tail', '@a.md !`echo a\nb`', "command"),
+      '@a.md ______ _\n__ tail'));
+
+  test("escaped path spellings match by decoded path while preserving expanded spacing", () =>
+    assert.equal(maskDirectReferences('@My\\ Notes.md @other.md', '@My\\ Notes.md'),
+      '____ ________ @other.md'));
+
+  test("escaped and code references in direct input do not mask fresh expansion references", () =>
+    assert.equal(maskDirectReferences('@a.md !`run`', '\\@a.md \\!`run` `@a.md`'),
+      '@a.md !`run`'));
+
+  test("code references in expanded text remain literal while prose references are masked", () =>
+    assert.equal(maskDirectReferences('`@a.md` @a.md\n~~~\n!`run`\n~~~\n!`run`', '@a.md !`run`'),
+      '`@a.md` _____\n~~~\n!`run`\n~~~\n______'));
 });
 
 describe("unit helpers", () => {

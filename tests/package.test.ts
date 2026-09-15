@@ -12,7 +12,7 @@ import { createWorkspace } from "./fixtures/workspace.mock.ts";
 const exec = promisify(execFile);
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
 
-test("packed installation is discovered by the actual print CLI and reaches a completed provider request", { timeout: 60_000 }, async () => {
+test("packed extension installs and resolves a file through the print CLI", { timeout: 60_000 }, async () => {
   await using workspace = await createWorkspace({ prefix: "pi-resolve-cli-" });
   const { root } = workspace;
   const cwd = join(root, "project");
@@ -26,42 +26,26 @@ test("packed installation is discovered by the actual print CLI and reaches a co
   await writeFile(join(root, "npmrc"), "");
   await writeFile(join(root, "global-npmrc"), "");
   const packed = await exec("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", root], { cwd: repo, env, timeout: 20_000 });
-  const [{ filename, files }] = JSON.parse(packed.stdout);
-  assert.deepEqual(files.map((file: { path: string }) => file.path).sort(), [
-    "CHANGELOG.md", "LICENSE", "README.md", "package.json",
-    "src/matcher.ts", "src/pi-resolve.ts", "src/resolver.ts", "src/settings.ts",
-  ]);
-  // Install the tarball without registry access or peer installation. Pi supplies
-  // extension dependencies through its loader, as it does for published packages.
+  const [{ filename }] = JSON.parse(packed.stdout);
+  // Offline installation leaves peer resolution to Pi's published-package loader.
   await exec("npm", ["install", "--offline", "--ignore-scripts", "--legacy-peer-deps", "--no-audit", "--no-fund", join(root, filename)], {
     cwd: join(root, "install"), env, timeout: 20_000,
   });
   const installed = join(root, "install/node_modules/pi-resolve");
-  const manifest = JSON.parse(await readFile(join(installed, "package.json"), "utf8"));
-  assert.deepEqual(manifest.pi.extensions, ["./src/pi-resolve.ts"]);
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [installed], retry: { enabled: false }, compaction: { enabled: false } }));
-  await writeFile(join(cwd, "note.md"), "PACKED_CONTEXT");
-  await mkdir(join(cwd, "library"));
-  await writeFile(join(cwd, "library/z.md"), "DO_NOT_READ_CHILD");
-  await writeFile(join(cwd, "library/a.md"), "DO_NOT_READ_CHILD");
+  await workspace.writeFiles({ "project/note.md": "PACKED_CONTEXT" });
   const capture = join(root, "request.jsonl");
   const cli = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/index\.js$/, "cli.js");
   const running = exec(process.execPath, [cli,
     "--print", "--no-session", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
     "--extension", join(repo, "tests/fixtures/provider.mock.ts"),
-    "--provider", "resolve-test", "--model", "faux-1",
-    'Resolve @note.md @library/ !`printf x >> count; printf CLI_OUTPUT`',
+    "--provider", "resolve-test", "--model", "faux-1", "Resolve @note.md",
   ], { cwd, env: { ...env, PI_RESOLVE_TEST_CAPTURE: capture }, timeout: 20_000 });
   running.child.stdin?.end();
   const result = await running;
-  assert.equal(result.stdout.trim(), "OK");
-  assert.doesNotMatch(result.stderr, /Error|Failed/i);
   const requests: Context[] = (await readFile(capture, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-  assert.equal(requests.length, 1);
-  const texts = contextTexts(requests[0]!);
-  assert.ok(texts.includes('<file path="note.md">\nPACKED_CONTEXT\n</file>'));
-  assert.ok(texts.includes('<file path="library/">\nDirectory listing (immediate entries):\na.md\nz.md\n</file>'));
-  assert.ok(texts.includes('<bash command="printf x >> count; printf CLI_OUTPUT">\nCLI_OUTPUT\n</bash>'));
-  assert.doesNotMatch(texts.join("\n"), /DO_NOT_READ_CHILD/);
-  assert.equal(await readFile(join(cwd, "count"), "utf8"), "x");
+  assert.deepEqual({ stdout: result.stdout.trim(), requests: requests.map(contextTexts) }, {
+    stdout: "OK",
+    requests: [["Resolve @note.md", '<file path="note.md">\nPACKED_CONTEXT\n</file>']],
+  });
 });

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { TestContext } from "node:test";
 import {
   AgentSessionRuntime, createAgentSession, DefaultResourceLoader, ModelRuntime,
-  SessionManager, SettingsManager, type CreateAgentSessionRuntimeFactory, type ExtensionFactory, type Theme,
+  SessionManager, SettingsManager, type CreateAgentSessionRuntimeFactory, type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import {
   fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryModelsStore,
@@ -58,12 +58,9 @@ export async function createHarness(t: TestContext, options: {
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: false }, retry: { enabled: false },
   });
-  let theme: Theme | undefined;
   let resourceLoader = new DefaultResourceLoader({
     cwd, agentDir, settingsManager,
-    extensionFactories: [piResolve, ...(options.extensions ?? []), (pi) => {
-      pi.on("session_start", (_event, ctx) => { theme = ctx.ui.theme; });
-    }],
+    extensionFactories: [piResolve, ...(options.extensions ?? [])],
   });
   await resourceLoader.reload();
   assert.deepEqual(resourceLoader.getExtensions().errors, []);
@@ -79,7 +76,6 @@ export async function createHarness(t: TestContext, options: {
   const errors: unknown[] = [];
   await session.bindExtensions({ onError: (error) => errors.push(error) });
   t.after(() => assert.deepEqual(errors, [], "extension errors"));
-  assert.ok(theme);
   function queue(response: FauxResponseStep = fauxAssistantMessage("OK")) {
     faux.appendResponses([async (context, options, state, model) => {
       requests.push({
@@ -91,7 +87,7 @@ export async function createHarness(t: TestContext, options: {
     }]);
   }
   return {
-    cwd, agentDir, requests, queue, theme,
+    cwd, agentDir, requests, queue,
     get session() { return session; },
     get sessionManager() { return sessionManager; },
     get resourceLoader() { return resourceLoader; },
