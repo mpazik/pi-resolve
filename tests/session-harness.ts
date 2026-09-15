@@ -1,17 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import type { TestContext } from "node:test";
 import {
-  createAgentSession, DefaultResourceLoader, ModelRuntime,
-  SessionManager, SettingsManager, type ExtensionFactory, type Theme,
+  AgentSessionRuntime, createAgentSession, DefaultResourceLoader, ModelRuntime,
+  SessionManager, SettingsManager, type CreateAgentSessionRuntimeFactory, type ExtensionFactory, type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
   fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryModelsStore,
   type Context, type FauxResponseStep,
 } from "@earendil-works/pi-ai";
 import piResolve from "../extensions/z-pi-resolve.ts";
+import { createWorkspace } from "./workspace-harness.ts";
 
 /** Real SDK/resources/processes. Only the model response is synthetic. */
 export async function createHarness(t: TestContext, options: {
@@ -21,7 +21,8 @@ export async function createHarness(t: TestContext, options: {
   extensions?: ExtensionFactory[];
   persist?: boolean;
 } = {}) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-resolve-sdk-")));
+  const workspace = await createWorkspace({ prefix: "pi-resolve-sdk-" });
+  const { root } = workspace;
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -33,20 +34,16 @@ export async function createHarness(t: TestContext, options: {
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      await rm(root, { recursive: true, force: true });
+      await workspace[Symbol.asyncDispose]();
     }
   });
   await mkdir(cwd, { recursive: true });
   await mkdir(agentDir);
-  for (const [path, content] of Object.entries(options.files ?? {})) {
-    await mkdir(dirname(join(cwd, path)), { recursive: true });
-    await writeFile(join(cwd, path), content);
-  }
-  if (options.globalSettings !== undefined) await writeFile(join(agentDir, "pi-resolve.json"), options.globalSettings);
-  if (options.projectSettings !== undefined) {
-    await mkdir(join(cwd, ".pi"), { recursive: true });
-    await writeFile(join(cwd, ".pi/pi-resolve.json"), options.projectSettings);
-  }
+  await workspace.writeFiles({
+    ...Object.fromEntries(Object.entries(options.files ?? {}).map(([path, content]) => [join("project", path), content])),
+    ...(options.globalSettings === undefined ? {} : { "agent/pi-resolve.json": options.globalSettings }),
+    ...(options.projectSettings === undefined ? {} : { "project/.pi/pi-resolve.json": options.projectSettings }),
+  });
   const faux = fauxProvider({ tokensPerSecond: Infinity });
   const requests: Context[] = [];
   const modelRuntime = await ModelRuntime.create({
@@ -62,7 +59,7 @@ export async function createHarness(t: TestContext, options: {
     compaction: { enabled: false }, retry: { enabled: false },
   });
   let theme: Theme | undefined;
-  const resourceLoader = new DefaultResourceLoader({
+  let resourceLoader = new DefaultResourceLoader({
     cwd, agentDir, settingsManager,
     extensionFactories: [piResolve, ...(options.extensions ?? []), (pi) => {
       pi.on("session_start", (_event, ctx) => { theme = ctx.ui.theme; });
@@ -70,10 +67,10 @@ export async function createHarness(t: TestContext, options: {
   });
   await resourceLoader.reload();
   assert.deepEqual(resourceLoader.getExtensions().errors, []);
-  const sessionManager = options.persist
+  let sessionManager = options.persist
     ? SessionManager.create(cwd, join(root, "sessions"))
     : SessionManager.inMemory(cwd);
-  const { session } = await createAgentSession({
+  let { session } = await createAgentSession({
     cwd, agentDir, modelRuntime, settingsManager,
     model: faux.getModel(), resourceLoader, sessionManager,
     noTools: "builtin",
@@ -94,7 +91,40 @@ export async function createHarness(t: TestContext, options: {
     }]);
   }
   return {
-    cwd, agentDir, session, sessionManager, resourceLoader, requests, queue, theme,
+    cwd, agentDir, requests, queue, theme,
+    get session() { return session; },
+    get sessionManager() { return sessionManager; },
+    get resourceLoader() { return resourceLoader; },
+    /** Use Pi's real replacement owner, not SessionManager mutation on a live agent. */
+    lifecycle() {
+      const createRuntime: CreateAgentSessionRuntimeFactory = async (target) => {
+        const loader = new DefaultResourceLoader({
+          cwd: target.cwd, agentDir: target.agentDir, settingsManager,
+          extensionFactories: [piResolve, ...(options.extensions ?? [])],
+        });
+        await loader.reload();
+        assert.deepEqual(loader.getExtensions().errors, []);
+        const result = await createAgentSession({
+          ...target, modelRuntime, settingsManager, model: faux.getModel(),
+          resourceLoader: loader, noTools: "builtin",
+        });
+        resourceLoader = loader;
+        return {
+          ...result, diagnostics: [],
+          services: { cwd: target.cwd, agentDir: target.agentDir, modelRuntime,
+            settingsManager, resourceLoader: loader, diagnostics: [] },
+        };
+      };
+      const runtime = new AgentSessionRuntime(session, {
+        cwd, agentDir, modelRuntime, settingsManager, resourceLoader, diagnostics: [],
+      }, createRuntime);
+      runtime.setRebindSession(async (replacement) => {
+        session = replacement;
+        sessionManager = replacement.sessionManager;
+        await replacement.bindExtensions({ onError: (error) => errors.push(error) });
+      });
+      return runtime;
+    },
     async prompt(text: string) {
       queue();
       await session.prompt(text);

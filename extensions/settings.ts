@@ -1,4 +1,4 @@
-export type Source = "userInput" | "systemPrompt" | "skill" | "extension";
+export type Source = "userInput" | "template" | "systemPrompt" | "skill" | "extension";
 export type Display = "always" | "never" | "errors";
 
 export interface SourceConfig {
@@ -7,12 +7,20 @@ export interface SourceConfig {
   display: Display;
 }
 
+export interface Limits {
+  maxFileBytes: number;
+  maxCommandBytes: number;
+  maxTotalBytes: number;
+}
+
 export interface Settings {
+  limits: Limits;
   defaults: SourceConfig;
   sources: Partial<Record<Source, Partial<SourceConfig>>>;
 }
 
 interface SettingsOverrides {
+  limits?: Partial<Limits>;
   defaults?: Partial<SourceConfig>;
   sources?: Partial<Record<Source, Partial<SourceConfig>>>;
 }
@@ -22,11 +30,17 @@ export interface SettingsIssue {
   code: "invalid-object" | "invalid-value" | "unknown-key";
 }
 
-const SOURCES: Source[] = ["userInput", "systemPrompt", "skill", "extension"];
+const SOURCES: Source[] = ["userInput", "template", "systemPrompt", "skill", "extension"];
 
 export const DEFAULT_SETTINGS: Settings = {
+  limits: { maxFileBytes: 100_000, maxCommandBytes: 100_000, maxTotalBytes: 1_000_000 },
   defaults: { files: true, commands: true, display: "always" },
-  sources: {},
+  sources: {
+    template: { commands: false },
+    systemPrompt: { display: "never" },
+    skill: { commands: false, display: "never" },
+    extension: { commands: false, display: "never" },
+  },
 };
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -66,7 +80,20 @@ export function validateSettings(value: unknown): {
   }
 
   for (const [key, field] of Object.entries(value)) {
-    if (key === "defaults") {
+    if (key === "limits") {
+      if (!isObject(field)) {
+        issues.push({ path: "limits", code: "invalid-object" });
+        continue;
+      }
+      settings.limits = {};
+      for (const [name, limit] of Object.entries(field)) {
+        if (name !== "maxFileBytes" && name !== "maxCommandBytes" && name !== "maxTotalBytes") {
+          issues.push({ path: "limits", code: "unknown-key" });
+        } else if (typeof limit === "number" && Number.isSafeInteger(limit) && limit > 0) {
+          settings.limits[name] = limit;
+        } else issues.push({ path: `limits.${name}`, code: "invalid-value" });
+      }
+    } else if (key === "defaults") {
       settings.defaults = validateConfig(field, "defaults");
     } else if (key === "sources") {
       if (!isObject(field)) {
@@ -92,9 +119,16 @@ export function mergeSettings(
 ): Settings {
   const sources: Settings["sources"] = {};
   for (const source of SOURCES) {
-    sources[source] = { ...global.sources?.[source], ...project.sources?.[source] };
+    sources[source] = {
+      ...DEFAULT_SETTINGS.sources[source],
+      ...global.defaults,
+      ...project.defaults,
+      ...global.sources?.[source],
+      ...project.sources?.[source],
+    };
   }
   return {
+    limits: { ...DEFAULT_SETTINGS.limits, ...global.limits, ...project.limits },
     defaults: { ...DEFAULT_SETTINGS.defaults, ...global.defaults, ...project.defaults },
     sources,
   };

@@ -19,7 +19,7 @@
  *     content is treated as inert text.
  *   - User input: resolved every turn
  *   - System prompt / AGENTS.md: resolved first turn only (commands inlined
- *     into the prompt text itself, display only)
+ *     into the prompt text itself, cached output reapplied each turn)
  *   - Skills: !`command` and @file resolved after expansion, with $ARGUMENTS
  *     substitution and skill baseDir as cwd
  *   - Errors: attached with error marker, shown as warnings in TUI
@@ -29,20 +29,46 @@
  *   `<cwd>/.pi/pi-resolve.json` (project, overrides global).
  *
  *   {
- *     "defaults": { "files": true, "commands": true, "display": "always" },
- *     "sources": {
- *       "userInput":       {},
- *       "systemPrompt":    { "display": "errors" },
- *       "skill":           { "commands": false }
- *     }
+ *     "limits": { "maxFileBytes": 100000, "maxCommandBytes": 100000,
+ *                 "maxTotalBytes": 1000000 },
+ *     "sources": { "template": { "commands": true } }
  *   }
  *
- *   `display` is one of "always" | "never" | "errors". Effective source config
- *   is `{ ...defaults, ...sources[name] }` (shallow override).
+ *   Files default on everywhere. Commands default on only for direct input
+ *   and trusted system/AGENTS content. Summaries default on only for direct
+ *   input and templates. Explicit defaults override built-in source defaults;
+ *   explicit source fields override global/project defaults. Project fields
+ *   can relax global fields. Limits merge per field as positive safe integers.
+ *
+ * Byte contract:
+ *   - A turn admits direct input, system, then expanded template/skill content
+ *     (skill trailing files last), each admitted in reference order. Capture
+ *     runs in batches of at most four, each bounded by the batch's starting
+ *     remaining capacity. Final admission discards over-budget captures.
+ *     Direct references resolve in input; its remaining budget carries into
+ *     before_agent_start for system and post-expansion references.
+ *   - Total counts UTF-8 successful file/bash attachment text INCLUDING wrappers,
+ *     plus successful system inline output (no wrapper). Deduplicated turn files
+ *     count once. Each shared event gets an independent budget and no deduplication.
+ *   - Reapplied system output counts once each turn; storing its cache adds no
+ *     charge. Prior conversation/history attachments are not new turn imports.
+ *   - File limits cover raw and decoded UTF-8 bytes; command capture bounds raw
+ *     stdout + stderr together before trimming. Only stdout is attached on success.
+ *   - Capture/read bounds also use remaining total capacity. Whole oversized
+ *     references are omitted, with safe failure notices exempt from the budget.
+ *     Commands with no output capacity are not started. Commands in an active
+ *     batch can have side effects even if ordered final admission rejects them;
+ *     omission does not roll back those effects.
+ *   - Directory entry count remains capped at 1000 with an explicit listing
+ *     notice. Byte overflow omits the whole listing rather than clipping it.
+ *   - Failure markers, original prompts, reference literals, and UI metadata are
+ *     not imported successes and do not consume the budget. Failure marker labels
+ *     longer than 160 UTF-16 units are explicitly shortened before escaping.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { stat, readFile, readdir } from "node:fs/promises";
+import { constants, existsSync, readFileSync } from "node:fs";
+import { open, stat, readdir } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
@@ -58,7 +84,6 @@ import {
 } from "@earendil-works/pi-tui";
 import {
   SKILL_BLOCK_REGEX,
-  extractFileRefs,
   extractFileReferenceMatches,
   extractCommandRefs,
 } from "./matcher.ts";
@@ -72,6 +97,7 @@ import {
   shouldDisplay,
   validateSettings,
   type Settings,
+  type Limits,
   type Source,
 } from "./settings.ts";
 
@@ -138,6 +164,7 @@ interface FileAttachment {
   error?: string;
   errorCode?: string;
   skipped?: boolean;
+  budgetExceeded?: boolean;
 }
 
 interface BashInline {
@@ -147,6 +174,7 @@ interface BashInline {
   output: string;
   error?: string;
   skipped?: boolean;
+  budgetExceeded?: boolean;
 }
 
 interface SkillBlock {
@@ -159,9 +187,75 @@ interface SkillBlock {
 
 // ---------- constants ----------
 
-const MAX_FILE_BYTES = 100_000;
 const MAX_DIRECTORY_ENTRIES = 1_000;
-const MAX_BASH_BYTES = 100_000;
+
+interface Budget {
+  remaining: number;
+}
+
+function charge(budget: Budget, text: string): boolean {
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > budget.remaining) return false;
+  budget.remaining -= bytes;
+  return true;
+}
+
+/** Bound raw stdout + stderr bytes before decoding or trimming either stream. */
+function captureCommand(command: string, cwd: string, maxBytes: number): Promise<{
+  stdout: string; stderr: string; code: number | null; killed: boolean; oversized: boolean;
+}> {
+  return new Promise((resolve, reject) => {
+    const grouped = process.platform !== "win32";
+    const child = spawn("sh", ["-c", command], {
+      cwd, detached: grouped, stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let bytes = 0;
+    let killed = false;
+    let oversized = false;
+    const cleanupGroup = () => {
+      // Killing only sh leaves grandchildren running and holding capture pipes open.
+      try {
+        if (grouped && child.pid) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill("SIGKILL");
+      }
+    };
+    const stop = () => {
+      cleanupGroup();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    };
+    const timer = setTimeout(() => {
+      killed = true;
+      stop();
+    }, 10_000);
+    const capture = (chunks: Buffer[]) => (chunk: Buffer) => {
+      if (oversized || killed) return;
+      if (chunk.length > maxBytes - bytes) {
+        oversized = true;
+        stop();
+        return;
+      }
+      bytes += chunk.length;
+      chunks.push(chunk);
+    };
+    child.stdout.on("data", capture(stdout));
+    child.stderr.on("data", capture(stderr));
+    child.on("exit", cleanupGroup);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      stop();
+      reject(error);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), code, killed: killed || signal !== null, oversized });
+    });
+  });
+}
 
 // ---------- path resolution ----------
 
@@ -219,115 +313,35 @@ function substituteSkillArgs(body: string, args: string): string {
 
 // ---------- bash inlining ----------
 
-/** Inline all !`command` references in text, replacing them with their output.
- *  Only processes refs that appear outside code blocks/spans. */
-async function inlineBashRefs(
-  text: string,
-  cwd: string,
-  pi: ExtensionAPI,
-  source: Source,
-): Promise<{ text: string; inlines: BashInline[] }> {
-  const matches = extractCommandRefs(text);
-  if (matches.length === 0) return { text, inlines: [] };
-
-  // Execute all commands in parallel
-  const [results] = await Promise.all([
-    Promise.all(
-      matches.map(async ({ command: cmd, fullMatch }) => {
-        try {
-          const result = await pi.exec("sh", ["-c", cmd], {
-            cwd,
-            timeout: 10_000,
-          });
-          const stdout = result.stdout.trimEnd();
-
-          if (stdout.length > MAX_BASH_BYTES) {
-            return {
-              cmd,
-              fullMatch,
-              inline: {
-                kind: "bash" as const,
-                source,
-                command: cmd,
-                output: "",
-                skipped: true,
-              },
-              replacement: fullMatch,
-            };
-          }
-
-          if (result.killed || result.code !== 0) {
-            // eslint-disable-next-line no-control-regex
-            const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-            const output = stripAnsi(
-              result.stderr.trim() || result.stdout.trim(),
-            ).slice(0, 500);
-            const detail = result.killed ? "command timed out or was killed" : output || `exit code ${result.code}`;
-            console.error(`[pi-resolve] Shell error (${cmd}): ${detail}`);
-            return {
-              cmd,
-              fullMatch,
-              inline: {
-                kind: "bash" as const,
-                source,
-                command: cmd,
-                output: "",
-                error: detail,
-              },
-              replacement: fullMatch,
-            };
-          }
-
-          return {
-            cmd,
-            fullMatch,
-            inline: {
-              kind: "bash" as const,
-              source,
-              command: cmd,
-              output: stdout,
-            },
-            replacement: stdout,
-          };
-        } catch (err: any) {
-          const detail = err instanceof Error ? err.message : String(err);
-          console.error(`[pi-resolve] Shell error (${cmd}): ${detail}`);
-          return {
-            cmd,
-            fullMatch,
-            inline: {
-              kind: "bash" as const,
-              source,
-              command: cmd,
-              output: "",
-              error: detail,
-            },
-            replacement: fullMatch,
-          };
-        }
-      }),
-    ),
-  ]);
-
-  // Replace in reverse offset order to preserve indices
-  const inlines: BashInline[] = [];
-  let result = text;
-  for (let i = results.length - 1; i >= 0; i--) {
-    const r = results[i]!;
-    const m = matches[i]!;
-    inlines.unshift(r.inline);
-    result =
-      result.slice(0, m.index) +
-      r.replacement +
-      result.slice(m.index + m.fullMatch.length);
+/** Resolve one command; imported output remains inert. */
+async function resolveCommand(
+  command: string, cwd: string, source: Source, maxBytes: number,
+): Promise<BashInline> {
+  const item: BashInline = { kind: "bash", source, command, output: "" };
+  try {
+    const result = await captureCommand(command, cwd, maxBytes);
+    const stdout = result.stdout.trimEnd();
+    if (result.oversized || Buffer.byteLength(stdout, "utf8") > maxBytes) {
+      return { ...item, skipped: true };
+    }
+    if (result.killed || result.code !== 0) {
+      // eslint-disable-next-line no-control-regex
+      const output = (result.stderr.trim() || result.stdout.trim()).replace(/\x1b\[[0-9;]*m/g, "").slice(0, 500);
+      const detail = result.killed ? "command timed out or was killed" : output || `exit code ${result.code}`;
+      console.error(`[pi-resolve] Shell error (${command}): ${detail}`);
+      return { ...item, error: detail };
+    }
+    return { ...item, output: stdout };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`[pi-resolve] Shell error (${command}): ${detail}`);
+    return { ...item, error: detail };
   }
-
-  return { text: result, inlines };
 }
 
 // ---------- file resolution ----------
 
-async function listDirectory(filepath: string): Promise<string> {
+async function listDirectory(filepath: string, maxBytes: number): Promise<string | undefined> {
   const entries = await readdir(filepath, { withFileTypes: true });
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   if (entries.length === 0) return "Directory listing (immediate entries):\n(empty directory)";
@@ -343,13 +357,14 @@ async function listDirectory(filepath: string): Promise<string> {
     const name = /[\r\n\t]/.test(entry.name) ? JSON.stringify(entry.name) : entry.name;
     const line = `${name}${entry.isDirectory() ? "/" : ""}`;
     const lineBytes = Buffer.byteLength(line, "utf8") + 1;
-    if (included >= MAX_DIRECTORY_ENTRIES || bytes + lineBytes + reservedBytes > MAX_FILE_BYTES) break;
+    if (included >= MAX_DIRECTORY_ENTRIES || bytes + lineBytes + reservedBytes > maxBytes) break;
     lines.push(line);
     bytes += lineBytes;
     included++;
   }
   if (included < entries.length) lines.push(truncationNotice(entries.length - included));
-  return lines.join("\n");
+  const content = lines.join("\n");
+  return Buffer.byteLength(content, "utf8") > maxBytes ? undefined : content;
 }
 
 /** Resolve @file references in text, returning attachments.
@@ -361,20 +376,30 @@ async function resolveFileReference(
   name: string,
   baseDir: string,
   source: Source,
+  maxBytes: number,
+  directoryMaxBytes = maxBytes,
 ): Promise<FileAttachment> {
   const filepath = resolvePath(name, baseDir);
   try {
     const stats = await stat(filepath);
     if (stats.isDirectory()) {
+      const content = await listDirectory(filepath, directoryMaxBytes);
+      const oversized = content === undefined || Buffer.byteLength(content, "utf8") > maxBytes;
       return {
         kind: "file",
         source,
         resolvedPath: filepath,
         displayPath: name,
-        content: await listDirectory(filepath),
+        content: oversized ? "" : content!,
+        skipped: oversized,
       };
     }
-    if (stats.size > MAX_FILE_BYTES) {
+    if (!stats.isFile()) throw new Error("not a regular file");
+    // O_NONBLOCK prevents a raced replacement with a FIFO from blocking open.
+    await using handle = await open(filepath, constants.O_RDONLY | constants.O_NONBLOCK);
+    const openedStats = await handle.stat();
+    if (!openedStats.isFile()) throw new Error("not a regular file");
+    if (openedStats.size > maxBytes) {
       return {
         kind: "file",
         source,
@@ -384,8 +409,18 @@ async function resolveFileReference(
         skipped: true,
       };
     }
-    const content = await readFile(filepath, "utf-8");
-    if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
+    // One sentinel byte detects growth after stat; never read the whole growing file.
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    while (bytes <= maxBytes) {
+      const buffer = Buffer.alloc(Math.min(64 * 1024, maxBytes - bytes + 1));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, bytes);
+      if (bytesRead === 0) break;
+      bytes += bytesRead;
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+    const content = bytes > maxBytes ? "" : Buffer.concat(chunks).toString("utf8");
+    if (bytes > maxBytes || Buffer.byteLength(content, "utf8") > maxBytes) {
       return {
         kind: "file",
         source,
@@ -418,32 +453,26 @@ async function resolveFileReference(
   }
 }
 
-async function resolveFileRefs(
-  text: string,
-  baseDir: string,
-  source: Source,
-): Promise<FileAttachment[]> {
-  return await Promise.all(
-    extractFileRefs(text).map((name) =>
-      resolveFileReference(name, baseDir, source),
-    ),
-  );
-}
-
-// ---------- dedup & format ----------
-
-function dedup(attachments: FileAttachment[]): FileAttachment[] {
-  const seen = new Set<string>();
-  return attachments.filter((a) => {
-    if (seen.has(a.resolvedPath)) return false;
-    seen.add(a.resolvedPath);
-    return true;
-  });
-}
+// ---------- format ----------
 
 function formatAttachment(a: FileAttachment): string {
-  if (a.error) return `<file path="${a.displayPath}" error="${a.error}" />`;
   return `<file path="${a.displayPath}">\n${a.content}\n</file>`;
+}
+
+/** Failure context never includes captured output or operational error details. */
+function formatFailure(item: FileAttachment | BashInline): string {
+  const status = item.skipped ? "oversized"
+    : item.kind === "file" && item.errorCode === "ENOENT" ? "missing" : "error";
+  const reason = item.budgetExceeded ? "total byte budget exceeded" : item.kind === "file"
+    ? status === "oversized" ? "file exceeds size limit" : status === "missing" ? "file not found" : "unable to read file"
+    : status === "oversized" ? "command output exceeds size limit" : "command failed";
+  const rawReference = item.kind === "file" ? item.displayPath : item.command;
+  const label = rawReference.length > 160 ? `${rawReference.slice(0, 160)} [reference shortened]` : rawReference;
+  const reference = label
+    .replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/\r/g, "&#13;").replace(/\n/g, "&#10;");
+  return `<${item.kind} ${item.kind === "file" ? "path" : "command"}="${reference}" status="${status}" reason="${reason}" />`;
 }
 
 function isResolveReferencesRequest(
@@ -458,25 +487,145 @@ function isResolveReferencesRequest(
   );
 }
 
+function formatBash(item: BashInline): string {
+  return `<bash command="${item.command}">\n${item.output}\n</bash>`;
+}
+
+async function resolveFileBudgeted(
+  name: string, baseDir: string, source: Source, limits: Limits, budget: Budget,
+): Promise<FileAttachment> {
+  const empty: FileAttachment = {
+    kind: "file", source, resolvedPath: resolvePath(name, baseDir), displayPath: name, content: "",
+  };
+  const available = budget.remaining - Buffer.byteLength(formatAttachment(empty), "utf8");
+  if (available < 0) return { ...empty, skipped: true, budgetExceeded: true };
+  const maxBytes = Math.min(limits.maxFileBytes, available);
+  const item = await resolveFileReference(name, baseDir, source, maxBytes, limits.maxFileBytes);
+  if (item.skipped) item.budgetExceeded = available < limits.maxFileBytes;
+  if (!item.skipped && !item.error && !charge(budget, formatAttachment(item))) {
+    return { ...empty, skipped: true, budgetExceeded: true };
+  }
+  return item;
+}
+
+async function resolveCommandBudgeted(
+  command: string, cwd: string, source: Source, limits: Limits, budget: Budget,
+): Promise<BashInline> {
+  const empty: BashInline = { kind: "bash", source, command, output: "" };
+  const overhead = source === "systemPrompt" ? 0 : Buffer.byteLength(formatBash(empty), "utf8");
+  const available = budget.remaining - overhead;
+  if (available <= 0) return { ...empty, skipped: true, budgetExceeded: true };
+  const item = await resolveCommand(command, cwd, source, Math.min(limits.maxCommandBytes, available));
+  if (item.skipped) item.budgetExceeded = available < limits.maxCommandBytes;
+  if (!item.skipped && !item.error && !charge(budget, source === "systemPrompt" ? item.output : formatBash(item))) {
+    return { ...empty, skipped: true, budgetExceeded: true };
+  }
+  return item;
+}
+
+function referenceCandidates(text: string, fileText = text) {
+  return [
+    ...extractFileReferenceMatches(fileText).map((reference) => ({ kind: "file" as const, ...reference })),
+    ...extractCommandRefs(text).map((reference) => ({ kind: "command" as const, ...reference })),
+  ].sort((left, right) => left.index - right.index);
+}
+
+/** Expansion may duplicate arguments. Without a source map, identical expanded
+ * references conservatively retain direct-input policy, including disabled refs. */
+function maskDirectReferences(text: string, input: string, kind?: "file" | "command"): string {
+  const key = (candidate: ReturnType<typeof referenceCandidates>[number]) =>
+    candidate.kind === "file" ? `file:${candidate.path}` : `command:${candidate.command}`;
+  const captured = new Set(referenceCandidates(input)
+    .filter((candidate) => !kind || candidate.kind === kind).map(key));
+  const consumed = referenceCandidates(text).filter((candidate) => captured.has(key(candidate)));
+  for (const match of consumed.reverse()) {
+    // Preserve argument positions for subsequent skill $N substitution.
+    const mask = match.fullMatch.replace(/\S/g, "_");
+    text = text.slice(0, match.index) + mask + text.slice(match.index + match.fullMatch.length);
+  }
+  return text;
+}
+
+interface ResolveSourceCtx {
+  settings: Settings;
+  budget: Budget;
+  seenFiles: Set<string>;
+  cwd: string;
+}
+
+/** Capture at most four references against a snapshot, then admit in text order.
+ * A command in the current batch can run even if final admission rejects it.
+ * Rejected output is discarded before the next batch starts.
+ */
+async function resolveBatches<T>(
+  candidates: T[], budget: Budget,
+  resolve: (candidate: T, budget: Budget) => Promise<FileAttachment | BashInline | undefined>,
+): Promise<(FileAttachment | BashInline | undefined)[]> {
+  const results: (FileAttachment | BashInline | undefined)[] = [];
+  for (let offset = 0; offset < candidates.length; offset += 4) {
+    const remaining = budget.remaining;
+    const batch = await Promise.all(candidates.slice(offset, offset + 4).map((candidate) =>
+      resolve(candidate, { remaining }),
+    ));
+    for (const item of batch) {
+      if (item && !item.error && !item.skipped) {
+        const payload = item.kind === "file" ? formatAttachment(item)
+          : item.source === "systemPrompt" ? item.output : formatBash(item);
+        if (!charge(budget, payload)) {
+          item.skipped = true;
+          item.budgetExceeded = true;
+          if (item.kind === "file") item.content = "";
+          else item.output = "";
+        }
+      }
+      results.push(item);
+    }
+  }
+  return results;
+}
+
+/** Bounded capture with deterministic ordered attachment admission. */
+async function resolveSource(
+  ctx: ResolveSourceCtx, text: string, source: Source, baseDir = ctx.cwd, fileText = text,
+): Promise<{ attachments: FileAttachment[]; inlines: BashInline[] }> {
+  const attachments: FileAttachment[] = [];
+  const inlines: BashInline[] = [];
+  const config = cfgFor(ctx.settings, source);
+  const results = await resolveBatches(referenceCandidates(text, fileText), ctx.budget, async (candidate, budget) => {
+    if (candidate.kind === "file" && config.files) {
+      const path = resolvePath(candidate.path, baseDir);
+      if (ctx.seenFiles.has(path)) return;
+      ctx.seenFiles.add(path);
+      return await resolveFileBudgeted(candidate.path, baseDir, source, ctx.settings.limits, budget);
+    } else if (candidate.kind === "command" && config.commands) {
+      return await resolveCommandBudgeted(candidate.command, ctx.cwd, source, ctx.settings.limits, budget);
+    }
+  });
+  for (const item of results) {
+    if (item?.kind === "file") attachments.push(item);
+    else if (item) inlines.push(item);
+  }
+  return { attachments, inlines };
+}
+
 async function resolveReferencesForExtension(
   request: ResolveReferencesRequest,
-  pi: ExtensionAPI,
   settings: Settings,
 ): Promise<ResolveReferencesResult> {
   const config = cfgFor(settings, "extension");
-  const candidates = [
-    ...extractFileReferenceMatches(request.text).map((reference) => ({
-      kind: "file" as const,
-      ...reference,
-    })),
-    ...extractCommandRefs(request.text).map((reference) => ({
-      kind: "command" as const,
-      ...reference,
-    })),
-  ].sort((left, right) => left.index - right.index);
+  const budget = { remaining: settings.limits.maxTotalBytes };
+  const candidates = referenceCandidates(request.text);
   const references: ReferenceResolution[] = [];
+  const resolved = await resolveBatches(candidates, budget, async (candidate, captureBudget) => {
+    if (candidate.kind === "file" && config.files) {
+      return await resolveFileBudgeted(candidate.path, request.baseDir, "extension", settings.limits, captureBudget);
+    }
+    if (candidate.kind === "command" && request.mode !== "files" && config.commands) {
+      return await resolveCommandBudgeted(candidate.command, request.baseDir, "extension", settings.limits, captureBudget);
+    }
+  });
 
-  for (const candidate of candidates) {
+  for (const [index, candidate] of candidates.entries()) {
     if (candidate.kind === "file") {
       if (!config.files) {
         references.push({
@@ -488,11 +637,8 @@ async function resolveReferencesForExtension(
         });
         continue;
       }
-      const attachment = await resolveFileReference(
-        candidate.path,
-        request.baseDir,
-        "extension",
-      );
+      const attachment = resolved[index];
+      if (attachment?.kind !== "file") throw new Error("Missing file resolution");
       const context =
         !attachment.skipped && !attachment.error
           ? formatAttachment(attachment)
@@ -511,7 +657,7 @@ async function resolveReferencesForExtension(
               : "success",
         ...(context ? { context } : {}),
         ...(attachment.skipped
-          ? { reason: `file exceeds ${MAX_FILE_BYTES} bytes` }
+          ? { reason: attachment.budgetExceeded ? "total byte budget exceeded" : `file exceeds ${settings.limits.maxFileBytes} bytes` }
           : attachment.error
             ? { reason: attachment.error }
             : {}),
@@ -532,16 +678,11 @@ async function resolveReferencesForExtension(
       });
       continue;
     }
-    const { inlines } = await inlineBashRefs(
-      candidate.fullMatch,
-      request.baseDir,
-      pi,
-      "extension",
-    );
-    const inline = inlines[0]!;
+    const inline = resolved[index];
+    if (inline?.kind !== "bash") throw new Error("Missing command resolution");
     const context =
       !inline.skipped && !inline.error
-        ? `<bash command="${inline.command}">\n${inline.output}\n</bash>`
+        ? formatBash(inline)
         : undefined;
     references.push({
       kind: "command",
@@ -550,7 +691,7 @@ async function resolveReferencesForExtension(
       status: inline.skipped ? "oversized" : inline.error ? "error" : "success",
       ...(context ? { context } : {}),
       ...(inline.skipped
-        ? { reason: `command output exceeds ${MAX_BASH_BYTES} bytes` }
+        ? { reason: inline.budgetExceeded ? "total byte budget exceeded" : `command output exceeds ${settings.limits.maxCommandBytes} bytes` }
         : inline.error
           ? { reason: inline.error }
           : {}),
@@ -602,7 +743,7 @@ function buildDetails(
       lines: result === "ok" ? countLines(b.output) : 0,
       result,
       message:
-        result === "skipped" ? "too large" : result === "error" ? b.error : undefined,
+        result === "skipped" ? b.budgetExceeded ? "total byte budget exceeded" : "too large" : result === "error" ? b.error : undefined,
     });
   }
 
@@ -616,11 +757,32 @@ function buildDetails(
       lines: result === "ok" ? countLines(a.content) : 0,
       result,
       message:
-        result === "skipped" ? "too large" : result === "error" ? a.error : undefined,
+        result === "skipped" ? a.budgetExceeded ? "total byte budget exceeded" : "too large" : result === "error" ? a.error : undefined,
     });
   }
 
   return { items };
+}
+
+/** Reattached cached output counts once in this turn, not again for its cache. */
+function applySystemInlines(
+  text: string, inlines: BashInline[], budget?: Budget, failures: BashInline[] = [],
+): string {
+  const cached = [...inlines];
+  const replacements = extractCommandRefs(text).map((match) => {
+    const index = cached.findIndex((inline) => inline.command === match.command);
+    const inline = index < 0 ? undefined : cached.splice(index, 1)[0];
+    if (!inline || inline.error || inline.skipped) return { ...match, output: match.fullMatch };
+    if (budget && !charge(budget, inline.output)) {
+      failures.push({ ...inline, output: "", skipped: true, budgetExceeded: true });
+      return { ...match, output: match.fullMatch };
+    }
+    return { ...match, output: inline.output };
+  });
+  for (const match of replacements.reverse()) {
+    text = text.slice(0, match.index) + match.output + text.slice(match.index + match.fullMatch.length);
+  }
+  return text;
 }
 
 // ---------- extension hook ----------
@@ -631,16 +793,19 @@ export default function (pi: ExtensionAPI) {
   let systemInlines: BashInline[] = [];
   let settings: Settings = DEFAULT_SETTINGS;
 
-  // Bash inlines captured from the input event. User text is kept as-is;
-  // outputs are attached as a separate context message in before_agent_start.
-  let pendingUserInlines: BashInline[] = [];
+  // Input precedes template/skill expansion. Carry provenance and budget together.
+  let pendingTurn: {
+    input: string;
+    ctx: ResolveSourceCtx;
+    direct: Awaited<ReturnType<typeof resolveSource>>;
+  } | undefined;
 
   // Extension commands bypass Pi's input and before_agent_start hooks. Expose
   // the same user-input resolution through the shared event bus so commands
   // that make their own model calls can opt in.
   pi.events.on(RESOLVE_REFERENCES_EVENT, (data) => {
     if (!isResolveReferencesRequest(data) || data.response) return;
-    data.response = resolveReferencesForExtension(data, pi, settings);
+    data.response = resolveReferencesForExtension(data, settings);
   });
 
   pi.registerMessageRenderer<ContextDetails>(
@@ -682,101 +847,64 @@ export default function (pi: ExtensionAPI) {
     sessionCwd = ctx.cwd;
     systemContextInjected = false;
     systemInlines = [];
+    pendingTurn = undefined;
     settings = loadSettings(sessionCwd);
   });
 
-  // Resolve !`command` in user input, but keep the original text intact.
-  // Outputs are attached as a separate context message (like @file), so the
-  // user still sees what they typed. Runs before skill expansion.
-  pi.on("input", async (event, ctx) => {
-    if (!cfgFor(settings, "userInput").commands) return { action: "continue" };
-
-    const matches = extractCommandRefs(event.text);
-    if (matches.length === 0) return { action: "continue" };
-
-    if (ctx.hasUI) {
-      const label =
-        matches.length === 1
-          ? matches[0]!.command
-          : `${matches.length} commands`;
-      ctx.ui.setWidget("pi-resolve", (tui, theme) => {
-        const loader = new Loader(
-          tui,
-          (s) => theme.fg("bashMode", s),
-          (s) => theme.fg("dim", s),
-          ` ${label}`,
-        );
-        loader.start();
-        return loader;
-      });
+  pi.on("input", async (event, extensionCtx) => {
+    pendingTurn = undefined;
+    const input = event.text;
+    const ctx: ResolveSourceCtx = {
+      settings, budget: { remaining: settings.limits.maxTotalBytes }, seenFiles: new Set(), cwd: sessionCwd,
+    };
+    const directConfig = cfgFor(settings, "userInput");
+    const commands = directConfig.commands ? extractCommandRefs(input ?? "") : [];
+    const showLoader = extensionCtx?.hasUI && directConfig.display === "always" && commands.length > 0;
+    let loader: Loader | undefined;
+    let direct: Awaited<ReturnType<typeof resolveSource>>;
+    try {
+      if (showLoader) {
+        const label = commands.length === 1 ? commands[0]!.command : `${commands.length} commands`;
+        extensionCtx.ui.setWidget("pi-resolve", (tui, theme) => {
+          loader = new Loader(tui, (s) => theme.fg("bashMode", s), (s) => theme.fg("dim", s), ` ${label}`);
+          loader.start();
+          return loader;
+        });
+      }
+      direct = await resolveSource(ctx, input ?? "", "userInput");
+    } finally {
+      loader?.stop();
+      if (showLoader) extensionCtx.ui.setWidget("pi-resolve", undefined);
     }
-
-    const { inlines } = await inlineBashRefs(
-      event.text,
-      sessionCwd,
-      pi,
-      "userInput",
-    );
-
-    if (ctx.hasUI) ctx.ui.setWidget("pi-resolve", undefined);
-
-    if (inlines.length > 0) pendingUserInlines = inlines;
+    pendingTurn = { input, ctx, direct };
     return { action: "continue" };
   });
 
   pi.on("before_agent_start", async (event) => {
-    const allAttachments: FileAttachment[] = [];
-    // Display-only: inlined into their own text (system prompt), TUI display only
+    const turn = pendingTurn;
+    pendingTurn = undefined;
+    const input = turn?.input;
+    const ctx: ResolveSourceCtx = turn?.ctx ?? {
+      settings, budget: { remaining: settings.limits.maxTotalBytes }, seenFiles: new Set(), cwd: sessionCwd,
+    };
+    const allAttachments = [...(turn?.direct.attachments ?? [])];
+    // Successful system output is inlined, not attached a second time.
     const displayOnlyInlines: BashInline[] = [];
-    // Context inlines: user input + skills — attached as a separate context message
-    const contextInlines: BashInline[] = [];
-    // User-input commands captured in the input event (original text kept as-is)
-    const userInlines = pendingUserInlines;
-    pendingUserInlines = [];
-    contextInlines.push(...userInlines);
+    const contextInlines = [...(turn?.direct.inlines ?? [])];
     let modifiedSystemPrompt: string | undefined;
 
     // --- System prompt — first turn only ---
     if (!systemContextInjected) {
-      const sysCfg = cfgFor(settings, "systemPrompt");
-      let inlinedSystem = event.systemPrompt;
-
-      if (sysCfg.commands) {
-        const r = await inlineBashRefs(
-          event.systemPrompt,
-          sessionCwd,
-          pi,
-          "systemPrompt",
-        );
-        inlinedSystem = r.text;
-        systemInlines = r.inlines;
-        // System prompt inlines are inlined into the prompt itself, display only
-        displayOnlyInlines.push(...systemInlines);
-      }
-
-      const systemFileRefs = sysCfg.files
-        ? await resolveFileRefs(event.systemPrompt, sessionCwd, "systemPrompt")
-        : [];
-
-      if (systemFileRefs.length > 0 || systemInlines.length > 0) {
-        allAttachments.push(...systemFileRefs);
-        modifiedSystemPrompt = inlinedSystem;
-      }
+      const resolved = await resolveSource(ctx, event.systemPrompt, "systemPrompt");
+      systemInlines = resolved.inlines;
+      displayOnlyInlines.push(...systemInlines);
+      allAttachments.push(...resolved.attachments);
       systemContextInjected = true;
+      modifiedSystemPrompt = applySystemInlines(event.systemPrompt, systemInlines);
     } else if (systemInlines.length > 0) {
       // Pi rebuilds the base system prompt each turn. Reapply captured output
       // without executing commands or replacing other extensions' context.
-      let text = event.systemPrompt;
-      const cached = [...systemInlines];
-      const replacements = extractCommandRefs(text).map((match) => {
-        const index = cached.findIndex((inline) => inline.command === match.command);
-        const inline = index < 0 ? undefined : cached.splice(index, 1)[0];
-        return { ...match, output: inline && !inline.error && !inline.skipped ? inline.output : match.fullMatch };
-      });
-      for (const match of replacements.reverse()) {
-        text = text.slice(0, match.index) + match.output + text.slice(match.index + match.fullMatch.length);
-      }
-      modifiedSystemPrompt = text;
+      modifiedSystemPrompt = applySystemInlines(event.systemPrompt, systemInlines, ctx.budget, displayOnlyInlines);
     }
 
     // --- User input / skill content — every turn ---
@@ -784,70 +912,29 @@ export default function (pi: ExtensionAPI) {
     const skill = parseSkillBlock(prompt);
 
     if (skill) {
-      const skillCfg = cfgFor(settings, "skill");
-      // Skill prompt: substitute $ARGUMENTS/$N, then resolve refs
-      const substituted = substituteSkillArgs(skill.body, skill.args);
-
-      if (skillCfg.commands) {
-        // !`command` runs from session cwd (project root), not the skill directory
-        const { inlines: skillInlines } = await inlineBashRefs(
-          substituted,
-          sessionCwd,
-          pi,
-          "skill",
-        );
-        // Can't modify prompt text post-expansion, attach as context
-        contextInlines.push(...skillInlines);
-      }
-
-      if (skillCfg.files) {
-        // @file refs resolve relative to skill baseDir (file references within the skill)
-        const skillFileRefs = await resolveFileRefs(
-          substituted,
-          skill.baseDir,
-          "skill",
-        );
-        allAttachments.push(...skillFileRefs);
-
-        // Also resolve @file refs in trailing arguments (relative to session cwd)
-        if (skill.args) {
-          const argsFileRefs = await resolveFileRefs(
-            skill.args,
-            sessionCwd,
-            "skill",
-          );
-          allAttachments.push(...argsFileRefs);
-        }
-      }
-    } else {
-      const inputCfg = cfgFor(settings, "userInput");
-      if (inputCfg.commands) {
-        // Templates expand after input. Execute only commands not already
-        // captured there, consuming matches so repeated commands stay distinct.
-        const captured = userInlines.map((inline) => inline.command);
-        const remaining = extractCommandRefs(prompt).filter(({ command }) => {
-          const index = captured.indexOf(command);
-          if (index < 0) return true;
-          captured.splice(index, 1);
-          return false;
-        });
-        const { inlines } = await inlineBashRefs(
-          remaining.map(({ fullMatch }) => fullMatch).join("\n"),
-          sessionCwd,
-          pi,
-          "userInput",
-        );
-        contextInlines.push(...inlines);
-      }
-      if (inputCfg.files) {
-        allAttachments.push(...await resolveFileRefs(prompt, sessionCwd, "userInput"));
-      }
+      const commandArgs = maskDirectReferences(skill.args, input ?? "", "command");
+      const substituted = substituteSkillArgs(skill.body, commandArgs);
+      const fileArgs = maskDirectReferences(skill.args, input ?? "", "file");
+      const fileText = substituteSkillArgs(skill.body, fileArgs);
+      const resolved = await resolveSource(ctx, substituted, "skill", skill.baseDir, fileText);
+      allAttachments.push(...resolved.attachments);
+      contextInlines.push(...resolved.inlines);
+      // Trailing args use the session directory, never execute them a second time.
+      const args = extractFileReferenceMatches(fileArgs).map(({ fullMatch }) => fullMatch).join("\n");
+      const resolvedArgs = await resolveSource(ctx, args, "skill");
+      allAttachments.push(...resolvedArgs.attachments);
+    } else if (prompt !== input) {
+      // References present in direct input retain its policy, including disabled
+      // references. Only newly introduced occurrences belong to the template.
+      const expanded = maskDirectReferences(prompt, input ?? "");
+      const resolved = await resolveSource(ctx, expanded, "template");
+      allAttachments.push(...resolved.attachments);
+      contextInlines.push(...resolved.inlines);
     }
 
-    const dedupedAttachments = dedup(allAttachments);
     const allDisplayInlines = [...displayOnlyInlines, ...contextInlines];
     const hasContent =
-      dedupedAttachments.length > 0 ||
+      allAttachments.length > 0 ||
       contextInlines.length > 0 ||
       allDisplayInlines.length > 0;
 
@@ -870,29 +957,29 @@ export default function (pi: ExtensionAPI) {
     if (hasContent) {
       const content: { type: "text"; text: string }[] = [];
 
-      // Context inlines (user input + skills) go into message content as a
-      // separate context message. Display-only inlines (system prompt) are
-      // already inlined into their own text.
+      // Successful system commands are already inlined. Failures retain their
+      // literal reference there and also need explicit model-facing context.
       for (const b of contextInlines) {
-        if (!b.skipped && !b.error) {
-          content.push({
-            type: "text",
-            text: `<bash command="${b.command}">\n${b.output}\n</bash>`,
-          });
-        }
+        content.push({
+          type: "text",
+          text: b.skipped || b.error ? formatFailure(b)
+            : formatBash(b),
+        });
+      }
+      for (const b of displayOnlyInlines) {
+        if (b.skipped || b.error) content.push({ type: "text", text: formatFailure(b) });
       }
 
-      for (const a of dedupedAttachments) {
-        if (!a.skipped && !a.error) {
-          content.push({ type: "text", text: formatAttachment(a) });
-        }
+      for (const a of allAttachments) {
+        content.push({ type: "text", text: a.skipped || a.error ? formatFailure(a) : formatAttachment(a) });
       }
 
+      const details = buildDetails(allAttachments, allDisplayInlines, settings);
       result.message = {
         customType: "context",
         content,
-        display: true,
-        details: buildDetails(dedupedAttachments, allDisplayInlines, settings),
+        display: details.items.length > 0,
+        details,
       };
     }
 

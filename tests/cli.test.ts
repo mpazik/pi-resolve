@@ -1,20 +1,20 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import type { Context } from "@earendil-works/pi-ai";
 import { contextTexts } from "./session-harness.ts";
+import { createWorkspace } from "./workspace-harness.ts";
 
 const exec = promisify(execFile);
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
 
-test("packed installation is discovered by the actual print CLI and reaches a completed provider request", { timeout: 60_000 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "pi-resolve-cli-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+test("packed installation is discovered by the actual print CLI and reaches a completed provider request", { timeout: 60_000 }, async () => {
+  await using workspace = await createWorkspace({ prefix: "pi-resolve-cli-" });
+  const { root } = workspace;
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
   const home = join(root, "home");

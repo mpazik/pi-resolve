@@ -1,5 +1,5 @@
 /**
- * Pure regex patterns and helpers used by pi-resolve to detect references
+ * Pure matching patterns and helpers used by pi-resolve to detect references
  * (`@file`, `` !`cmd` ``) and skill envelopes in text.
  *
  * Dependency-free so they can be unit-tested without loading the pi/tui
@@ -32,15 +32,91 @@ export function buildCodeRanges(
   text: string,
 ): Array<[start: number, end: number]> {
   const ranges: Array<[number, number]> = [];
-  for (const m of text.matchAll(/^```[\s\S]*?^```/gm)) {
-    ranges.push([m.index, m.index + m[0].length]);
+  let fence: { start: number; marker: string; length: number } | undefined;
+  let proseStart = 0;
+  let lineStart = 0;
+
+  while (lineStart < text.length) {
+    const newline = text.indexOf("\n", lineStart);
+    const lineEnd = newline === -1 ? text.length : newline + 1;
+    const line = text.slice(lineStart, newline === -1 ? lineEnd : newline)
+      .replace(/\r$/, "");
+    // Only the line prefix needs a pattern. Fence pairing is stateful.
+    const delimiter = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (delimiter) {
+      const run = delimiter[1]!;
+      const rest = delimiter[2]!;
+      if (fence) {
+        if (run[0] === fence.marker && run.length >= fence.length && /^[ \t]*$/.test(rest)) {
+          ranges.push([fence.start, lineEnd]);
+          fence = undefined;
+          proseStart = lineEnd;
+        }
+      } else if (run[0] === "~" || !rest.includes("`")) {
+        appendInlineCodeRanges(text, proseStart, lineStart, ranges);
+        fence = { start: lineStart, marker: run[0]!, length: run.length };
+      }
+    }
+    lineStart = lineEnd;
   }
-  for (const m of text.matchAll(/!`[^`]+`|``[^`]*``|`[^`]*`/g)) {
-    if (m[0][0] !== "!") {
-      ranges.push([m.index, m.index + m[0].length]);
+
+  if (fence) ranges.push([fence.start, text.length]);
+  else appendInlineCodeRanges(text, proseStart, text.length, ranges);
+  return ranges;
+}
+
+/** Scan one prose region. Backtick runs pair only with runs of equal length.
+ *  Index runs first so unmatched delimiters do not cause repeated suffix scans. */
+function appendInlineCodeRanges(
+  text: string,
+  start: number,
+  end: number,
+  ranges: Array<[number, number]>,
+): void {
+  const runs = new Map<number, { positions: number[]; cursor: number }>();
+  let offset = start;
+  while (offset < end) {
+    if (text[offset] !== "`") {
+      offset++;
+      continue;
+    }
+    const runStart = offset;
+    while (offset < end && text[offset] === "`") offset++;
+    const length = offset - runStart;
+    const entry = runs.get(length);
+    if (entry) entry.positions.push(runStart);
+    else runs.set(length, { positions: [runStart], cursor: 0 });
+  }
+
+  offset = start;
+  while (offset < end) {
+    // Shell syntax takes precedence only outside an already matched code span.
+    // Preserve the existing non-empty, single-backtick command grammar.
+    if (text[offset] === "!" && text[offset - 1] !== "`" && text[offset + 1] === "`") {
+      const close = text.indexOf("`", offset + 2);
+      if (close > offset + 2 && close < end) {
+        offset = close + 1;
+        continue;
+      }
+    }
+    if (text[offset] !== "`") {
+      offset++;
+      continue;
+    }
+    const runStart = offset;
+    while (offset < end && text[offset] === "`") offset++;
+    const length = offset - runStart;
+    const entry = runs.get(length);
+    if (!entry) continue;
+    while (entry.cursor < entry.positions.length && entry.positions[entry.cursor]! < offset) {
+      entry.cursor++;
+    }
+    const close = entry.positions[entry.cursor];
+    if (close !== undefined) {
+      ranges.push([runStart, close + length]);
+      offset = close + length;
     }
   }
-  return ranges;
 }
 
 /** Check if a character offset falls inside any code range. */
@@ -110,7 +186,10 @@ export function extractCommandRefs(text: string): CommandRef[] {
   const ranges = buildCodeRanges(text);
   const out: CommandRef[] = [];
   for (const m of text.matchAll(SHELL_REGEX)) {
-    if (isInsideCode(m.index, ranges)) continue;
+    // Reject the whole command if any part crosses a code boundary, not just
+    // commands whose opening marker is inside code.
+    const end = m.index + m[0].length;
+    if (ranges.some(([start, stop]) => m.index < stop && end > start)) continue;
     out.push({ index: m.index, fullMatch: m[0], command: m[1]! });
   }
   return out;

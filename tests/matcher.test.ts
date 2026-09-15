@@ -1,4 +1,5 @@
-import { test } from "node:test";
+import { describe, test } from "node:test";
+
 import assert from "node:assert/strict";
 
 import {
@@ -8,10 +9,9 @@ import {
   unescapePath,
   isBareWord,
   extractFileRefs,
+  extractFileReferenceMatches,
   extractCommandRefs,
 } from "../extensions/matcher.ts";
-
-// ---------- capture assertions ----------
 
 /** What pi-resolve would resolve from a prompt: file paths and shell commands. */
 function captures(text: string): { files: string[]; commands: string[] } {
@@ -39,8 +39,6 @@ const assertCommandCapture = (text: string, command: string) =>
 
 const assertNoCapture = (text: string) => assertCapture(text, {});
 
-// ---------- @file ----------
-
 test("@file: bare reference", () =>
   assertFileCapture("hello @file.md world", "file.md"));
 
@@ -52,6 +50,9 @@ test("@file: inside inline code is skipped", () =>
 
 test("@file: inside fenced block is skipped", () =>
   assertNoCapture("before\n```\n@file.md\n```\nafter"));
+
+test("@file: inside tilde fence is skipped", () =>
+  assertNoCapture("~~~\n@hidden.md\n~~~"));
 
 test("@file: email-like address is not a file", () =>
   assertNoCapture("ping me at user@example.com"));
@@ -90,7 +91,6 @@ test("@file: multiple references", () =>
     files: ["./a.md", "./b.md"],
   }));
 
-// ---------- !`command` ----------
 
 test("!`cmd`: bare reference", () =>
   assertCommandCapture("today is !`date`", "date"));
@@ -101,11 +101,20 @@ test("!`cmd`: backtick before ! suppresses", () =>
 test("!`cmd`: inside fenced block is skipped", () =>
   assertNoCapture("before\n```\n!`date`\n```\nafter"));
 
+test("!`cmd`: inside tilde shell fence is skipped", () =>
+  assertNoCapture("~~~sh\n!`date`\n~~~"));
+
 test("!`cmd`: backslash before ! does NOT suppress (documents non-escape)", () =>
   assertCommandCapture("literal \\!`date`", "date"));
 
 test("!`cmd`: backslash before backtick breaks the pattern (accidental, not a real escape)", () =>
   assertNoCapture("literal !\\`date\\`"));
+
+test("!`cmd`: cannot close inside a fenced block", () =>
+  assertNoCapture("!`echo\n~~~sh\nhidden`\n~~~"));
+
+test("!`cmd`: multiline command outside code is preserved", () =>
+  assertCommandCapture("!`echo first\necho second`", "echo first\necho second"));
 
 test("!`cmd`: empty command does not match", () =>
   assertNoCapture("x !`` y"));
@@ -115,7 +124,6 @@ test("!`cmd`: multiple in one line", () =>
     commands: ["echo 1", "echo 2"],
   }));
 
-// ---------- mixed ----------
 
 test("mixed: file and command in same prompt", () =>
   assertCapture("see @./readme.md and run !`pwd`", {
@@ -123,7 +131,118 @@ test("mixed: file and command in same prompt", () =>
     commands: ["pwd"],
   }));
 
-// ---------- <skill> envelope ----------
+
+test("fences: three-space indentation is allowed", () =>
+  assertCapture("   ~~~sh\n@hidden.md !`hidden`\n   ~~~\n@visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: shorter backtick run does not close a longer fence", () =>
+  assertCapture("````\n```\n@hidden.md !`hidden`\n````\n@visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: longer closing run is allowed", () =>
+  assertCapture("~~~\n@hidden.md !`hidden`\n~~~~~\n@visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: different fence character does not close a fence", () =>
+  assertCapture("~~~\n```\n@hidden.md !`hidden`\n~~~\n@visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: closing run followed by text is not a closer", () =>
+  assertCapture("```\n``` not-a-close\n@hidden.md !`hidden`\n```\n@visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: closing run allows trailing spaces and tabs", () =>
+  assertCapture("~~~\n@hidden.md !`hidden`\n~~~ \t\n@visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: CRLF preserves fence boundaries", () =>
+  assertCapture("~~~sh\r\n@hidden.md !`hidden`\r\n~~~\r\n@visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: references in the fence info string are suppressed", () =>
+  assertCapture("~~~ @hidden.md !`hidden`\n~~~\n@visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: unclosed tilde fence suppresses through EOF", () =>
+  assertCapture("@visible.md !`visible`\n~~~sh\n@hidden.md !`hidden`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: unclosed backtick fence suppresses through EOF", () =>
+  assertCapture("@visible.md !`visible`\n```sh\n@hidden.md !`hidden`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: closing fence at EOF is sufficient", () =>
+  assertCapture("@visible.md !`visible`\n~~~\n@hidden.md !`hidden`\n~~~", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("fences: two tildes do not open a fence", () =>
+  assertCommandCapture("~~\n!`visible`\n~~", "visible"));
+
+test("fences: backtick in backtick-fence info string invalidates opener", () =>
+  assertCommandCapture("```sh`x`\n!`visible`", "visible"));
+
+
+test("spans: double-backtick span contains shell delimiters", () =>
+  assertCapture("`` @hidden.md !`hidden` `` @visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("spans: longer span contains shorter backtick runs", () =>
+  assertCapture("```` example `` @hidden.md !`hidden` ```` @visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("spans: code span may cross a newline", () =>
+  assertCapture("`` example\n@hidden.md !`hidden`\n`` @visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("spans: unmatched opening run stays literal", () =>
+  assertCapture("unmatched ``` @visible.md !`visible`", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("spans: inline span cannot cross a fenced block", () =>
+  assertCapture("before ``\n~~~\n@hidden.md !`hidden`\n~~~\n@visible.md !`visible`\nend ``", {
+    files: ["visible.md"], commands: ["visible"],
+  }));
+
+test("spans: references immediately outside a span remain visible", () =>
+  assertCapture("@before.md `@hidden.md` !`after`", {
+    files: ["before.md"],
+    commands: ["after"],
+  }));
+
+test("spans: many unmatched runs leave subsequent references visible", () =>
+  assertFileCapture(
+    Array.from({ length: 256 }, (_, index) => "`".repeat(index + 2)).join(" x ") + " @visible.md",
+    "visible.md",
+  ));
+
+
+test("offsets: UTF-16 indices and escaped source text are preserved", () => {
+  const text = "😀 @a\\ b.md !`echo ok` @a\\ b.md";
+  assert.deepEqual(extractFileReferenceMatches(text), [
+    { index: 3, fullMatch: "@a\\ b.md", path: "a b.md" },
+    { index: 23, fullMatch: "@a\\ b.md", path: "a b.md" },
+  ]);
+  assert.deepEqual(extractCommandRefs(text), [
+    { index: 12, fullMatch: "!`echo ok`", command: "echo ok" },
+  ]);
+});
+
 
 const SKILL_SAMPLE = [
   '<skill name="my-skill" location="/abs/path/SKILL.md">',
@@ -174,7 +293,6 @@ test("SKILL_BLOCK_REGEX: non-skill text does not match", () => {
   assert.equal("just a regular message".match(SKILL_BLOCK_REGEX), null);
 });
 
-// ---------- unit helpers ----------
 
 test("unescapePath collapses backslash escapes", () => {
   assert.equal(unescapePath("./My\\ Notes.md"), "./My Notes.md");

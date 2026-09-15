@@ -1,16 +1,21 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { test } from "node:test";
+import { describe, test } from "node:test";
+import { stripVTControlCharacters } from "node:util";
+import { initTheme, SessionManager } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import consumerExtension from "./data/consumer-extension.ts";
 import { createHarness, contextTexts } from "./session-harness.ts";
+import { createResolverHarness } from "./resolver-harness.ts";
+
+
 
 const files = { "note.md": "CONSUMER_CONTENT", "secret.md": "MUST_NOT_ATTACH", "large.md": "x".repeat(100_001) };
 
 test("extension command explicitly propagates extension-policy context and failures to its model call without resolver UI", async (t) => {
   const h = await createHarness(t, { files, extensions: [consumerExtension], projectSettings: JSON.stringify({ sources: {
-    userInput: { files: false, commands: false }, extension: { display: "always" },
+    userInput: { files: false, commands: false }, extension: { commands: true, display: "always" },
   } }) });
   h.queue();
   await h.session.prompt('/consumer @note.md @missing.md @large.md !`printf x >> consumer-count; printf COMMAND_OUTPUT` !`exit 8`');
