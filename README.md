@@ -2,7 +2,7 @@
 
 Give [Pi](https://pi.dev) instant context from files and shell commands.
 
-![Pi resolving file and command references in a prompt](https://raw.githubusercontent.com/mpazik/pi-resolve/main/.github/media/pi-resolve.png)
+![Pi resolving file and command references in a prompt](https://github.com/user-attachments/assets/865feaec-1b02-4c9a-a5e4-477c1bb0142a)
 
 Pi receives the files and command output before the agent responds, saving the time and
 token overhead of extra tool calls. Your prompt stays unchanged, with file and
@@ -25,7 +25,9 @@ Architecture: @docs/architecture.md
 Coding conventions: @docs/conventions.md
 
 Active guides:
-!`find docs -type f -name '*.md' -exec env DOC={} yq -f extract 'select(.status == "active") | [strenv(DOC), .description] | @tsv' {} \;`
+!`find docs -type f -name '*.md' -exec env DOC={} \
+  yq -f extract \
+  'select(.status == "active") | [strenv(DOC), .description] | @tsv' {} \;`
 ```
 
 Here, Pi receives the contents of the architecture and conventions files and a
@@ -128,22 +130,6 @@ Other extensions must opt into the shared resolver below. Prompts injected with
 `pi.sendUserMessage`, including their expanded templates and skills, are not
 automatically resolved. Arbitrary tool inputs and outputs are also left untouched.
 
-## Limitations
-
-- **Queued prompts:** steering and follow-up messages do not receive resolved
-  context. Commands typed in them can still execute without their output
-  reaching the model. Submit references after the agent finishes instead.
-- **Single-level imports:** references inside imported files or command output
-  stay literal. Listing filenames does not attach those files.
-- **System context is a snapshot:** system references resolve on the first turn
-  after session start or reload, not on every turn. Cached command output is
-  reused rather than refreshed.
-- **Repeated template references:** a reference identical to one typed in the
-  prompt keeps direct-prompt permissions, even if template settings would
-  otherwise allow it.
-- **Command ordering:** separate command expressions can run concurrently. Put
-  dependent operations in one expression rather than relying on their order.
-
 ## Settings
 
 Settings are optional and loaded at session start:
@@ -176,16 +162,12 @@ Each entry in `sources`, or the shared `defaults` object, accepts:
 | `commands` | Run command references and include their output. |
 | `display` | Show file/command status rows in Pi's conversation UI: `"always"`, `"errors"` (errors and skipped items only), or `"never"`. |
 
-UI feedback includes the path or command, line count, and any error. Hiding it
-with `display` does not remove content sent to the model, including notices for
-failed or oversized imports. Set both `files` and `commands` to `false` to disable
-a source.
+`display` only controls UI feedback. To disable a source, set both `files` and
+`commands` to `false`.
 
-Omitted values keep the defaults shown above. Project settings override global
-settings per field; source-specific settings override `defaults` from either
-file. Invalid settings are ignored with a warning. Use plain JSON without
-comments or trailing commas, and start a new session after changes. Project
-settings are trusted: they can re-enable commands disabled in global settings.
+Unspecified values keep their defaults. Project settings override global settings
+per field; source settings override `defaults`. Only use trusted project settings:
+they can re-enable commands. Use plain JSON and restart the session after changes.
 
 ### Limits
 
@@ -193,50 +175,37 @@ settings are trusted: they can re-enable commands disabled in global settings.
 |---|---:|---|
 | `maxFileBytes` | 100,000 bytes | Each file or directory listing. |
 | `maxCommandBytes` | 100,000 bytes | Combined stdout/stderr for each command. |
-| `maxTotalBytes` | 1,000,000 bytes | Imported context per turn or shared request, including wrappers and cached system output. |
-| `commandTimeoutMs` | 10,000 ms | Execution time for each command, including shared-resolver calls. |
+| `maxTotalBytes` | 1,000,000 bytes | Imported context per turn or shared request. |
+| `commandTimeoutMs` | 10,000 ms | Each command. |
 
-Byte limits are positive integers and do not cap your prompt or history.
-`commandTimeoutMs` accepts integers from 1 to 2,147,483,647 milliseconds. Timed-out
-commands are terminated; partial output is not attached.
-
-Imports that exceed the total budget are omitted, not cut off. Direct input takes
-priority, then system context, then templates or skills. Directory listings can
-truncate at their per-file limit or 1,000 entries, with an omitted-entry count.
+Over-budget imports are skipped; directory listings may be shortened. Timed-out
+commands are stopped and their output discarded. These limits do not cap your
+prompt or history.
 
 ## Extension integration
 
-System-prompt references added by another extension are resolved only if its
-hook runs before pi-resolve's. Use the shared resolver below to avoid relying on
-hook order.
+Emit `pi-resolve:resolve` with `{ version: 1, text, baseDir, mode? }`, then await
+`request.response` if present. The response contains `context` strings to attach
+and `references` with per-item status. The caller handles attachment and UI,
+including failures. No response means pi-resolve is unavailable.
 
-Extension commands bypass Pi's input hooks. To resolve their references, emit
-`pi-resolve:resolve` with `{ version: 1, text, baseDir, mode? }`. pi-resolve sets
-`request.response` to a promise containing:
+Shared calls use `sources.extension`: files enabled, commands disabled by default.
+`mode` accepts `"all"` or `"files"`; it cannot enable disabled commands. Commands
+run in `baseDir`.
 
-- `context`: ordered strings ready to include in the model's context.
-- `references`: results with `kind`, `reference`, source offset `index`, and
-  `status` (`success`, `missing`, `oversized`, `disabled`, or `error`). Successful
-  results include `context`; results may also include `resolvedPath` and `reason`.
+## Caveats
 
-`mode` is `"all"` or `"files"`. Shared calls use `sources.extension` (files enabled,
-commands disabled by default); `"files"` mode can further restrict permissions,
-never enable them. Commands run in `baseDir`. The caller attaches results and
-owns the UI feedback.
-
-Check that `request.response` exists before awaiting it: no response means the
-resolver is unavailable. Check each result before using it, so a missing file or
-failed command is reported rather than silently left out of the model's context.
+- Queued steering and follow-up prompts do not receive resolved context, but
+  their commands may still run. Wait until the agent finishes to submit references.
+- Imports are single-level: references inside files or command output stay literal.
+- System references resolve once after session start or reload, not every turn.
+- Commands may run concurrently. Put dependent steps in one expression.
+- System references added by other extensions depend on hook order. Use the
+  shared resolver for explicit integration.
 
 ## Development
 
-Use Node.js 26 for development (Node.js 24 also runs the checks). Native tests
-use `await using`, which Node.js 22 cannot parse directly. The installed extension
-runs through Pi's TypeScript loader, so this does not limit its runtime support.
-CI runs the full suite on Node.js 24 and 26 and the packed Pi CLI on Node.js 22,
-on both macOS and Linux.
-
-From a checkout:
+Use Node.js 26 for development. From a checkout:
 
 ```bash
 npm install
@@ -245,8 +214,6 @@ npm test
 pi -e .
 ```
 
-Pi loads TypeScript directly; there is no build step. Tests use Pi's faux provider
-and isolated directories, with no external model calls or real credentials. The
-suite includes a packed CLI smoke test and command-timeout checks.
+No build step or model credentials are needed.
 
 [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
