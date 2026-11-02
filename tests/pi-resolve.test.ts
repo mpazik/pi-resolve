@@ -6,10 +6,12 @@ import { createWorkspace, readFileEffects } from "./fixtures/workspace.mock.ts";
 import { stripVTControlCharacters } from "node:util";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
-type SummaryItem = { kind: string; label: string; path?: string; lines: number; result: string; message?: string };
+type SummaryItem = {
+  kind: string; label: string; path?: string; lines: number; result: string; message?: string; contentIndex?: number;
+};
 
 async function assertSummary(input: {
-  prompt: string; files: Record<string, string>; display?: "always" | "errors" | "never";
+  prompt: string; files: Record<string, string>; display?: "always" | "errors" | "never"; expanded?: boolean;
 }, expected: { items: SummaryItem[]; rows: string[] | null }) {
   await using workspace = await createWorkspace({ files: {
     ...input.files,
@@ -31,7 +33,7 @@ async function assertSummary(input: {
   assert.ok(renderer);
   // Test row content and spacing, not terminal color selection.
   const theme = { fg: (_color: string, text: string) => text, inverse: (text: string) => text } as Theme;
-  const component = renderer(message, { expanded: false, outputPad: 0 }, theme);
+  const component = renderer(message, { expanded: input.expanded ?? false, outputPad: 0 }, theme);
   assert.deepEqual({
     items: message.details.items.map((item: SummaryItem) => ({
       ...item, ...(item.path && { path: item.path.replaceAll(workspace.root, "<cwd>") }),
@@ -44,13 +46,26 @@ test("summary rows preserve command-first order, file paths, and empty and multi
   assertSummary({ files: { "empty.md": "", "lines.md": "one\ntwo\n" },
     prompt: '@empty.md !`true` @lines.md !`printf "one\\ntwo\\n"`' }, {
     items: [
-      { kind: "bash", label: "true", lines: 0, result: "ok", message: undefined },
-      { kind: "bash", label: 'printf "one\\ntwo\\n"', lines: 2, result: "ok", message: undefined },
-      { kind: "file", label: "empty.md", path: "<cwd>/empty.md", lines: 0, result: "ok", message: undefined },
-      { kind: "file", label: "lines.md", path: "<cwd>/lines.md", lines: 3, result: "ok", message: undefined },
+      { kind: "bash", label: "true", lines: 0, result: "ok", message: undefined, contentIndex: 0 },
+      { kind: "bash", label: 'printf "one\\ntwo\\n"', lines: 2, result: "ok", message: undefined, contentIndex: 1 },
+      { kind: "file", label: "empty.md", path: "<cwd>/empty.md", lines: 0, result: "ok", message: undefined, contentIndex: 2 },
+      { kind: "file", label: "lines.md", path: "<cwd>/lines.md", lines: 3, result: "ok", message: undefined, contentIndex: 3 },
     ],
     rows: [' bash  true (0 lines)', ' bash  printf "one\\ntwo\\n" (2 lines)',
       ' file  empty.md (0 lines)', ' file  lines.md (3 lines)'],
+  }));
+
+test("expanded display shows each successful item's content under its row", () =>
+  assertSummary({ files: { "lines.md": "one\ntwo\n", "large.md": "x".repeat(100_001) },
+    prompt: '!`printf OUT` @lines.md !`exit 7` @large.md', expanded: true }, {
+    items: [
+      { kind: "bash", label: "printf OUT", lines: 1, result: "ok", message: undefined, contentIndex: 0 },
+      { kind: "bash", label: "exit 7", lines: 0, result: "error", message: "exit code 7" },
+      { kind: "file", label: "lines.md", path: "<cwd>/lines.md", lines: 3, result: "ok", message: undefined, contentIndex: 2 },
+      { kind: "file", label: "large.md", path: "<cwd>/large.md", lines: 0, result: "skipped", message: "too large" },
+    ],
+    rows: [' bash  printf OUT (1 line)', ' OUT', ' bash  exit 7  error  — exit code 7',
+      ' file  lines.md (3 lines)', ' one', ' two', ' file  large.md  ignored  — too large'],
   }));
 
 test("error-only display renders failures and omissions without successful rows", () =>

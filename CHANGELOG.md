@@ -4,6 +4,8 @@
 
 - Add manual patch/minor releases with changelog-driven release notes and npm
   publishing after CI and packed-package checks.
+- Show the attached file contents and command output under their status rows
+  when tool output is expanded (Ctrl+O by default).
 
 ## 0.1.0 (2026-09-15)
 

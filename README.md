@@ -162,8 +162,9 @@ Each entry in `sources`, or the shared `defaults` object, accepts:
 | `commands` | Run command references and include their output. |
 | `display` | Show file/command status rows in Pi's conversation UI: `"always"`, `"errors"` (errors and skipped items only), or `"never"`. |
 
-`display` only controls UI feedback. To disable a source, set both `files` and
-`commands` to `false`.
+Expand tool output (Ctrl+O by default) to see each attached file or command
+output under its status row. `display` only controls UI feedback. To disable a
+source, set both `files` and `commands` to `false`.
 
 Unspecified values keep their defaults. Project settings override global settings
 per field; source settings override `defaults`. Only use trusted project settings:

@@ -97,6 +97,8 @@ interface AttachmentLine {
   lines: number;
   result: "ok" | "error" | "skipped";
   message?: string;
+  /** Index of this item's model-facing text in the message content; shown when expanded. */
+  contentIndex?: number;
 }
 
 interface ContextDetails {
@@ -106,6 +108,7 @@ interface ContextDetails {
 function buildDetails(
   attachments: FileAttachment[],
   inlines: BashInline[],
+  contentItems: (FileAttachment | BashInline)[],
   settings: Settings,
 ): ContextDetails {
   const items: AttachmentLine[] = [];
@@ -123,9 +126,19 @@ function buildDetails(
       lines: result === "ok" && content ? content.split("\n").length : 0,
       result,
       message,
+      ...(result === "ok" && contentItems.includes(item) ? { contentIndex: contentItems.indexOf(item) } : {}),
     });
   }
   return { items };
+}
+
+/** Returns the body of a successful `<file>` or `<bash>` context block, without its wrapper lines. */
+function contextBody(content: string | readonly { type: string; text?: string }[], index: number): string {
+  const block = typeof content === "string" ? undefined : content[index];
+  const text = block?.type === "text" ? block.text ?? "" : "";
+  const start = text.indexOf("\n");
+  const end = text.lastIndexOf("\n");
+  return start >= 0 && end > start ? text.slice(start + 1, end).replace(/\n$/, "") : "";
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -151,7 +164,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.registerMessageRenderer<ContextDetails>(
     "context",
-    (message, _options, theme) => {
+    (message, options, theme) => {
       const items = message.details?.items ?? [];
       if (items.length === 0) return undefined;
       const container = new Container();
@@ -172,6 +185,10 @@ export default function (pi: ExtensionAPI): void {
           if (item.message) meta += theme.fg("dim", ` — ${item.message}`);
         }
         container.addChild(new Text(badge + label + meta, 0, 0));
+        if (options.expanded && item.contentIndex !== undefined) {
+          const body = contextBody(message.content, item.contentIndex);
+          if (body) container.addChild(new Text(theme.fg("toolOutput", body), 1, 0));
+        }
       }
       return container;
     },
@@ -288,12 +305,13 @@ export default function (pi: ExtensionAPI): void {
     if (hasContent) {
       // Successful system commands are already inlined. Failures retain their
       // literal reference there and also need explicit model-facing context.
-      const content = [
+      const contentItems = [
         ...contextInlines,
         ...displayOnlyInlines.filter((item) => item.skipped || item.error),
         ...allAttachments,
-      ].map((item) => ({ type: "text" as const, text: formatContext(item) }));
-      const details = buildDetails(allAttachments, allDisplayInlines, settings);
+      ];
+      const content = contentItems.map((item) => ({ type: "text" as const, text: formatContext(item) }));
+      const details = buildDetails(allAttachments, allDisplayInlines, contentItems, settings);
       result.message = {
         customType: "context",
         content,
