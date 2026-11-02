@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.1 (2026-11-02)
+
 - Add manual patch/minor releases with changelog-driven release notes and npm
   publishing after CI and packed-package checks.
 - Show the attached file contents and command output under their status rows
